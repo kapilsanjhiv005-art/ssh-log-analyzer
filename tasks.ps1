@@ -19,7 +19,7 @@ switch ($Task) {
         .\.venv\Scripts\sshlog-analyzer.exe --file sample_logs/auth.log --year 2026
     }
     "dashboard" {
-        .\.venv\Scripts\streamlit.exe run dashboard.py --server.address localhost
+        .\.venv\Scripts\streamlit.exe run dashboard.py --server.address 127.0.0.1
     }
     "benchmark" {
         .\.venv\Scripts\python.exe benchmark.py

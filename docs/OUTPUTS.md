@@ -7,16 +7,16 @@
 | Field | Type | Meaning |
 |---|---|---|
 | `alerts` | array of objects | Alerts retained after optional minimum-severity filtering |
-| `incidents` | array of objects | Correlated overlapping alerts, with `incident_id`, `source_ip`, first/last timestamps, contributing rules, combined severity, and summary |
+| `incidents` | array of objects | Correlated overlapping alerts, with `incident_id`, `source_ip`, first/last timestamps, contributing rules, combined severity, summary, and available deduplicated attempt/user/method evidence |
 | `risk_scores` | object keyed by source IP | Each value has integer `score` and string `band` |
 | `alerts_suppressed` | integer | Alert count suppressed by the allowlist |
 | `config_used` | object | Validated effective configuration after CLI overrides |
-| `parse_stats` | object | `lines_read`, `events_parsed`, `lines_ignored`, and `lines_malformed` counts |
+| `parse_stats` | object | input-line counters: `lines_read`, `events_parsed` (parsed source records), `lines_ignored`, and `lines_malformed`; repeated-message occurrence weights are not expanded into line counters |
 | `version` | string | Analyzer version |
 | `schema_version` | integer | Report schema version (currently 3) |
 | `generated_at` | ISO-8601 string | ISO-8601 report-generation timestamp (UTC in CLI reports) |
 
-Each alert includes the common fields `rule`, `severity`, `base_severity`, `source_ip`, `first_seen`, `last_seen`, `attempt_count`, `usernames_targeted`, `description`, `mitre_attack_id`, `mitre_technique_name`, and `recommended_action`. `severity` and `base_severity` identify the rule-level severity. Source-based alerts also include `source_risk_score` and `source_risk_band`, which describe composite per-IP risk; legacy `risk_score` and `risk_band` fields remain as aliases. Incidents include `combined_severity`, `risk_score`, and `risk_band`; combined severity is derived from the documented source risk band. Rule-specific details may add fields such as `paths`, `statuses`, `user_agent`, `source_ips`, or `target_username`. When adjacent alerts are merged, `merged_alert_count` and `unique_event_count` report aggregation size. Timestamp values are serialized as ISO-8601 strings. Fields can vary by rule.
+Each alert includes the common fields `rule`, `severity`, `base_severity`, `source_ip`, `first_seen`, `last_seen`, `attempt_count`, `usernames_targeted`, `authentication_methods`, `description`, `mitre_attack_id`, `mitre_technique_name`, and `recommended_action`. `severity` and `base_severity` identify the rule-level severity. Source-based alerts also include `source_risk_score` and `source_risk_band`, which describe composite per-IP risk; legacy `risk_score` and `risk_band` fields remain as aliases. Incidents include `combined_severity`, `risk_score`, and `risk_band`; combined severity is derived from the documented source risk band. Rule-specific details may add fields such as `paths`, `statuses`, `user_agent`, `source_ips`, or `target_username`. When adjacent alerts are merged, `merged_alert_count` and `unique_event_count` report aggregation size. Timestamp values are serialized as ISO-8601 strings. Fields can vary by rule.
 
 ## CSV
 

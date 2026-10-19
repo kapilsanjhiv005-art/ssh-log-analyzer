@@ -44,7 +44,10 @@ def _chart_data(events: list[dict[str, Any]], risk_scores: dict[str, Any]) -> tu
             stamp = event["timestamp"]
             if not isinstance(stamp, datetime):
                 stamp = datetime.fromisoformat(stamp)
-            counts[stamp.replace(minute=0, second=0, microsecond=0)] += 1
+            weight = event.get("occurrence_count", 1)
+            counts[stamp.replace(minute=0, second=0, microsecond=0)] += (
+                weight if isinstance(weight, int) and weight > 0 else 1
+            )
         x_values = sorted(counts)
         axis.plot(x_values, [counts[x] for x in x_values], marker="o", color="#2673a8")
         axis.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
@@ -88,7 +91,7 @@ def render_html_report(events: list[dict[str, Any]], result: dict[str, Any]) -> 
     alerts = result.get("alerts", [])
     incidents = result.get("incidents", [])
     risks = result.get("risk_scores", {})
-    severity_counts = Counter(alert["severity"] for alert in alerts)
+    severity_counts = Counter(alert.get("base_severity", alert["severity"]) for alert in alerts)
     parse_stats = result.get("parse_stats", {})
     chart_timeline, chart_ips = _chart_data(events, risks)
 
@@ -102,11 +105,14 @@ def render_html_report(events: list[dict[str, Any]], result: dict[str, Any]) -> 
             f"<td>{_escape(item.get('source_ip'))}</td>"
             f"<td>{_escape(item.get('first_seen'))}</td>"
             f"<td>{_escape(item.get('last_seen'))}</td>"
+            f"<td>{_escape(item.get('attempt_count', 'n/a'))}</td>"
+            f"<td>{_escape(item.get('usernames_targeted', []))}</td>"
+            f"<td>{_escape(item.get('authentication_methods', []))}</td>"
             f"<td>{_escape(item.get('contributing_rules'))}</td>"
             f"<td>{_escape(item.get('summary'))}</td></tr>"
             for item in incidents
         )
-        or '<tr><td colspan="9">No correlated incidents.</td></tr>'
+        or '<tr><td colspan="12">No correlated incidents.</td></tr>'
     )
 
     risk_rows = (
@@ -126,6 +132,7 @@ def render_html_report(events: list[dict[str, Any]], result: dict[str, Any]) -> 
             ("path", "Path"),
             ("user_agent", "User agent"),
             ("referrer", "Referrer"),
+            ("authentication_methods", "Authentication methods"),
         ):
             if alert.get(field):
                 extra.append(f"<div><b>{label}:</b> {_escape(alert[field])}</div>")
@@ -177,7 +184,7 @@ li{{margin:.35rem 0}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{co
 <div class="metric"><b>{len(incidents)}</b><br>Incidents</div><div class="metric"><b>{_escape(stats_summary)}</b><br>Parser coverage</div>
 <div class="metric"><b>{_escape(result.get("alerts_suppressed", 0))}</b><br>Alerts suppressed by allowlist</div></div>
 <h3>Alert base-severity counts</h3><ul>{severity_html}</ul></section>
-<section><h2>Incidents</h2><table><thead><tr><th>ID</th><th>Composite severity</th><th>Risk score</th><th>Risk band</th><th>Source IP</th><th>First seen</th><th>Last seen</th><th>Rules</th><th>Summary</th></tr></thead><tbody>{incident_rows}</tbody></table></section>
+<section><h2>Incidents</h2><table><thead><tr><th>ID</th><th>Composite severity</th><th>Risk score</th><th>Risk band</th><th>Source IP</th><th>First seen</th><th>Last seen</th><th>Attempts</th><th>Targeted usernames</th><th>Authentication methods</th><th>Rules</th><th>Summary</th></tr></thead><tbody>{incident_rows}</tbody></table></section>
 <section><h2>Top risky IPs</h2><table><thead><tr><th>Source IP</th><th>Score</th><th>Band</th></tr></thead><tbody>{risk_rows}</tbody></table></section>
 <section class="charts"><h2>Charts</h2><img alt="Failed attempts over time" src="data:image/png;base64,{chart_timeline}"><img alt="Top source IPs by risk" src="data:image/png;base64,{chart_ips}"></section>
 <section><h2>Alert timeline</h2><ol>{timeline}</ol></section>

@@ -495,3 +495,41 @@ def load_allowlist_from(value):
     import ipaddress
 
     return [ipaddress.ip_network(value)]
+
+
+def test_repeated_event_occurrences_count_toward_thresholds_and_risk():
+    repeated = event(0, ip="203.0.113.88")
+    repeated["occurrence_count"] = 5
+
+    result = analyze_events([repeated])
+
+    brute = next(alert for alert in result["alerts"] if alert["rule"] == "ssh_brute_force")
+    assert brute["attempt_count"] == 5
+    assert "5 failed attempts" in brute["description"]
+    assert result["risk_scores"]["203.0.113.88"]["score"] == 15
+
+
+def test_overlapping_rule_incident_reports_deduplicated_evidence():
+    events = [event(i, username=name) for i, name in enumerate(("a", "b", "c", "d", "e"))]
+    for item in events:
+        item["authentication_method"] = "password"
+
+    result = analyze_events(events)
+    incident = result["incidents"][0]
+
+    assert incident["attempt_count"] == 5
+    assert incident["usernames_targeted"] == ["a", "b", "c", "d", "e"]
+    assert incident["authentication_methods"] == ["password"]
+    assert all("_incident_event_counts" not in alert for alert in result["alerts"])
+
+
+def test_repeated_failures_qualify_success_after_failures():
+    repeated = event(0, ip="203.0.113.89", username="admin")
+    repeated["occurrence_count"] = 5
+    success = event(10, ip="203.0.113.89", username="admin", kind="authentication_success")
+
+    result = analyze_events([repeated, success])
+
+    alert = next(item for item in result["alerts"] if item["rule"] == "ssh_success_after_failures")
+    assert alert["attempt_count"] == 5
+    assert result["risk_scores"]["203.0.113.89"] == {"score": 75, "band": "Critical"}

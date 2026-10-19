@@ -19,6 +19,8 @@ SSH and Web Log Analyzer is a local, offline defensive tool for reviewing OpenSS
 - Export CSV and JSON, generate a self-contained HTML report with embedded charts, or inspect results in a local Streamlit dashboard.
 - Follow appended log lines in read-only mode and print newly observed alerts once per stable alert key.
 - Generate synthetic SSH and web samples using documentation IP ranges.
+- Parse OpenSSH `message repeated N times` authentication lines as weighted occurrences without expanding them into duplicate event objects.
+- Filter dashboard alerts and incidents by source IP, UTC date range, and rule severity; export the filtered view to JSON, CSV, or HTML.
 
 ## Detection rules
 
@@ -53,6 +55,10 @@ flowchart LR
 
 SSH and web detections use one alert-merging, incident-correlation, and risk-scoring pipeline. Alerts for the same rule and source merge when windows overlap or are within the configured merge gap; overlapping rules from the same IP can form one incident.
 
+## Dashboard
+
+The dashboard keeps rule-severity alert counts separate from unique source-risk bands. It includes parser line counts and percentages (parsed and malformed percentages use lines read as the denominator), a malformed-rate warning above 5%, alert and incident tables, source/date/severity filters, an hourly timeline with optional log scale and alert/incident scope, top-five source timelines, root and username summaries, and filtered JSON/CSV/HTML downloads. A successful login after failures is labeled a potential compromise indicator, not a confirmed compromise. Timestamps are shown in UTC; an alert is included when its window overlaps the selected date range, while event-based views show events inside the range. The project Streamlit config binds to `127.0.0.1`, disables usage statistics, and uses the minimal toolbar.
+
 ## Quick start
 
 ### Windows PowerShell
@@ -64,7 +70,7 @@ python -m pip install -e ".[dev]"
 python -m pytest -v
 sshlog-analyzer --file sample_logs/auth.log --year 2026
 sshlog-analyzer --file sample_logs/web_access.log --log-type web
-streamlit run dashboard.py --server.address localhost
+streamlit run dashboard.py --server.address 127.0.0.1
 ```
 
 Use a Python 3.11 or newer installation available as `python`; the Windows `py` launcher is not required.
@@ -78,7 +84,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -v
 sshlog-analyzer --file sample_logs/auth.log --year 2026
 sshlog-analyzer --file sample_logs/web_access.log --log-type web
-streamlit run dashboard.py --server.address localhost
+streamlit run dashboard.py --server.address 127.0.0.1
 ```
 
 The dashboard binds to loopback in these commands. It does not upload logs to an external service. The CLI and report generator also operate locally.
@@ -112,7 +118,7 @@ sshlog-analyzer --file .\private-data\auth.log --year 2025 --format html
 sshlog-analyzer --file ./private-data/auth.log --year 2025 --format html
 ```
 
-`--year` supplies the year for yearless syslog timestamps. The parser increments the inferred year when it sees a December-to-January rollover. Review the resulting parser coverage because distro versions, PAM messages, and log formats vary.
+`--year` supplies the year for yearless syslog timestamps. The parser increments the inferred year when it sees a December-to-January rollover. OpenSSH `message repeated N times: [...]` authentication records are represented as one parsed record with an `occurrence_count`; detections and source-risk volume use that count without expanding duplicate events. Parser counters continue to count input lines and parsed records. Review parser coverage because distro versions, PAM messages, and log formats vary.
 
 For combined Nginx/Apache access logs:
 

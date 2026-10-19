@@ -58,3 +58,26 @@ def test_report_escapes_log_derived_username_and_user_agent():
             "config_used": {},
         },
     )
+
+
+def test_incident_evidence_fields_are_rendered_and_escaped():
+    incident = {
+        "incident_id": "INC-001",
+        "combined_severity": "High",
+        "risk_score": 60,
+        "risk_band": "High",
+        "source_ip": "192.0.2.10",
+        "first_seen": "2026-10-19T08:00:00",
+        "last_seen": "2026-10-19T08:00:05",
+        "attempt_count": 5,
+        "usernames_targeted": ["<script>alert(1)</script>"],
+        "authentication_methods": ["password"],
+        "contributing_rules": ["ssh_brute_force", "ssh_password_spraying"],
+        "summary": "two related rules",
+    }
+    document = render_html_report([], {"alerts": [], "incidents": [incident], "risk_scores": {}})
+
+    assert "5</td>" in document
+    assert "password" in document
+    assert "<script>alert(1)</script>" not in document
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in document

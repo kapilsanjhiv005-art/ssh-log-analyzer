@@ -65,20 +65,20 @@ def export_json(data, output_path):
     return output_path
 
 
-def export_csv(alerts, output_path):
-    """Export security alerts to a CSV file."""
+def _safe_csv_cell(value):
+    """Prefix spreadsheet formula-like log text so CSV opens as plain text."""
+    if isinstance(value, str) and value.lstrip("\ufeff \t\r\n")[:1] in {"=", "+", "-", "@"}:
+        return "'" + value
+    if isinstance(value, list):
+        return [_safe_csv_cell(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _safe_csv_cell(item) for key, item in value.items()}
+    return value
 
-    def safe_cell(value):
-        """Prefix spreadsheet formula-like log text so CSV opens as plain text."""
-        if isinstance(value, str) and value.lstrip("\ufeff \t\r\n")[:1] in {"=", "+", "-", "@"}:
-            return "'" + value
-        if isinstance(value, list):
-            return [safe_cell(item) for item in value]
-        if isinstance(value, dict):
-            return {key: safe_cell(item) for key, item in value.items()}
-        return value
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def render_csv(alerts):
+    """Serialize alerts to CSV using the same safe fields as file exports."""
+    import io
 
     if not alerts:
         fieldnames = [
@@ -100,24 +100,18 @@ def export_csv(alerts, output_path):
             "risk_band",
         ]
     else:
-        # Include all fields, even when different alert types
-        # have different additional details.
         fieldnames = list(dict.fromkeys(key for alert in alerts for key in alert.keys()))
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(_safe_csv_cell(_output_value(alert)) for alert in alerts)
+    return output.getvalue()
 
-    with output_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
-            extrasaction="ignore",
-        )
 
-        writer.writeheader()
-        writer.writerows(safe_cell(_output_value(alert)) for alert in alerts)
-
+def export_csv(alerts, output_path):
+    """Export security alerts to a CSV file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_csv(alerts), encoding="utf-8", newline="")
     return output_path
 
 
@@ -133,7 +127,7 @@ def print_summary(events, result, parse_stats):
     incidents = result["incidents"]
     risk_scores = result["risk_scores"]
 
-    severity_counts = Counter(alert["severity"] for alert in alerts)
+    severity_counts = Counter(alert.get("base_severity", alert["severity"]) for alert in alerts)
 
     rule_counts = Counter(alert["rule"] for alert in alerts)
 
@@ -142,6 +136,14 @@ def print_summary(events, result, parse_stats):
     print("=" * 72)
 
     print(f"Log events analyzed            : {len(events)}")
+    effective_count = sum(
+        event.get("occurrence_count", 1)
+        if isinstance(event.get("occurrence_count", 1), int)
+        and event.get("occurrence_count", 1) > 0
+        else 1
+        for event in events
+    )
+    print(f"Effective event occurrences    : {effective_count}")
     print(f"Security alerts generated      : {len(alerts)}")
     print(
         "Parser coverage                : "

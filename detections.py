@@ -120,7 +120,7 @@ def _base_alert(
     mitre_id, technique_name, action = RULE_INFO[rule]
     times = [get_event_time(record) for record in records]
     usernames = sorted({record["username"] for record in records if record.get("username")})
-    count = attempt_count if attempt_count is not None else len(records)
+    count = attempt_count if attempt_count is not None else _event_count(records)
     alert = {
         "rule": rule,
         "severity": severity,
@@ -130,6 +130,13 @@ def _base_alert(
         "last_seen": max(times) if times else None,
         "attempt_count": count,
         "usernames_targeted": usernames,
+        "authentication_methods": sorted(
+            {
+                record["authentication_method"]
+                for record in records
+                if record.get("authentication_method")
+            }
+        ),
         "description": description,
         "mitre_attack_id": mitre_id,
         "mitre_technique_name": technique_name,
@@ -138,16 +145,36 @@ def _base_alert(
         "attack_technique": mitre_id,
         "attempts": count,
         "_merge_event_ids": [_event_identity(record) for record in records],
+        "_incident_event_counts": {
+            _event_identity(record): _event_occurrences(record) for record in records
+        },
         "_merge_attempt_ids": [
             _event_identity(record)
             for record in records
             if rule not in {"ssh_success_after_failures", "web_success_after_failures"}
             or _is_failure(record)
         ],
+        "_merge_attempt_counts": {
+            _event_identity(record): _event_occurrences(record)
+            for record in records
+            if rule not in {"ssh_success_after_failures", "web_success_after_failures"}
+            or _is_failure(record)
+        },
         "window_seconds": details.get("window_seconds", 60),
         **details,
     }
     return alert
+
+
+def _event_occurrences(event: dict[str, Any]) -> int:
+    """Return the represented occurrence count, defaulting legacy events to one."""
+    value = event.get("occurrence_count", 1)
+    return value if isinstance(value, int) and value > 0 else 1
+
+
+def _event_count(records: list[dict[str, Any]]) -> int:
+    """Sum represented occurrences without expanding repeated log messages."""
+    return sum(_event_occurrences(record) for record in records)
 
 
 def _event_identity(event: dict[str, Any]) -> Any:
@@ -206,8 +233,14 @@ def merge_adjacent_alerts(
                 attempt_ids = set().union(
                     *(set(item.get("_merge_attempt_ids", [])) for item in cluster)
                 )
+                attempt_counts: dict[Any, int] = {}
+                for item in cluster:
+                    for identity, count in item.get("_merge_attempt_counts", {}).items():
+                        attempt_counts[identity] = max(attempt_counts.get(identity, 0), count)
                 result["attempt_count"] = (
-                    len(attempt_ids)
+                    sum(attempt_counts.values())
+                    if attempt_counts
+                    else len(attempt_ids)
                     if attempt_ids
                     else sum(item.get("attempt_count", 0) for item in cluster)
                 )
@@ -219,7 +252,13 @@ def merge_adjacent_alerts(
                 result["usernames_targeted"] = sorted(
                     set().union(*(set(item.get("usernames_targeted", [])) for item in cluster))
                 )
-                for field in ("paths", "statuses", "user_agents", "source_ips"):
+                for field in (
+                    "paths",
+                    "statuses",
+                    "user_agents",
+                    "source_ips",
+                    "authentication_methods",
+                ):
                     values = [value for item in cluster for value in item.get(field, [])]
                     if values:
                         result[field] = sorted(set(values))
@@ -236,6 +275,22 @@ def merge_adjacent_alerts(
             result["_merge_attempt_ids"] = list(
                 set().union(*(set(item.get("_merge_attempt_ids", [])) for item in cluster))
             )
+            result["_incident_event_counts"] = {
+                identity: max(
+                    item.get("_incident_event_counts", {}).get(identity, 0) for item in cluster
+                )
+                for identity in set().union(
+                    *(set(item.get("_incident_event_counts", {})) for item in cluster)
+                )
+            }
+            result["_merge_attempt_counts"] = {
+                identity: max(
+                    item.get("_merge_attempt_counts", {}).get(identity, 0) for item in cluster
+                )
+                for identity in set().union(
+                    *(set(item.get("_merge_attempt_counts", {})) for item in cluster)
+                )
+            }
             merged.append(result)
     merged.sort(
         key=lambda item: (
@@ -320,14 +375,15 @@ def detect_brute_force(
     alerts = []
     for ip, failures in grouped.items():
         for cluster in _clusters(failures, window):
-            if len(cluster) >= threshold:
+            if _event_count(cluster) >= threshold:
                 alerts.append(
                     _base_alert(
                         "ssh_brute_force",
                         "Medium",
                         ip,
                         cluster,
-                        f"{_count_word(len(cluster), 'failed attempt')} observed within {int(window.total_seconds())} seconds.",
+                        f"{_count_word(_event_count(cluster), 'failed attempt')} observed within {int(window.total_seconds())} seconds.",
+                        attempt_count=_event_count(cluster),
                         window_seconds=int(window.total_seconds()),
                     )
                 )
@@ -357,7 +413,8 @@ def detect_password_spraying(
                         "Medium",
                         ip,
                         cluster,
-                        f"{_count_word(len(cluster), 'failed attempt')} against {_count_word(len(usernames), 'distinct username')} within {int(window.total_seconds())} seconds.",
+                        f"{_count_word(_event_count(cluster), 'failed attempt')} against {_count_word(len(usernames), 'distinct username')} within {int(window.total_seconds())} seconds.",
+                        attempt_count=_event_count(cluster),
                         distinct_usernames=len(usernames),
                         usernames=usernames,
                         window_seconds=int(window.total_seconds()),
@@ -421,7 +478,7 @@ def detect_root_attempts(
     alerts = []
     for ip, failures in group_events_by_ip(root_failures).items():
         for cluster in _clusters(failures, window):
-            if len(cluster) < minimum_attempts:
+            if _event_count(cluster) < minimum_attempts:
                 continue
             alerts.append(
                 _base_alert(
@@ -429,7 +486,8 @@ def detect_root_attempts(
                     "Low",
                     ip,
                     cluster,
-                    f"{_count_word(len(cluster), 'failed attempt')} targeted root.",
+                    f"{_count_word(_event_count(cluster), 'failed attempt')} targeted root.",
+                    attempt_count=_event_count(cluster),
                     username="root",
                     username_target_count=1,
                     window_seconds=int(window.total_seconds()),
@@ -452,18 +510,20 @@ def detect_success_after_failures(
         if is_allowlisted(ip, allowlist):
             continue
         failures: deque[dict[str, Any]] = deque()
+        active_failure_count = 0
         all_failures: list[dict[str, Any]] = []
         qualifying_successes: list[dict[str, Any]] = []
         for event in group:
             current = get_event_time(event)
             while failures and current - get_event_time(failures[0]) > lookback:
-                failures.popleft()
+                active_failure_count -= _event_occurrences(failures.popleft())
             if _is_failure(event):
                 failures.append(event)
+                active_failure_count += _event_occurrences(event)
                 all_failures.append(event)
             elif (
                 event.get("event_type") == "authentication_success"
-                and len(failures) >= failure_threshold
+                and active_failure_count >= failure_threshold
             ):
                 qualifying_successes.append(event)
         failure_times = [get_event_time(event) for event in all_failures]
@@ -484,8 +544,8 @@ def detect_success_after_failures(
                 ip,
                 records,
                 "Successful SSH authentication followed repeated failures from the same source IP. Investigate for possible account compromise.",
-                attempt_count=len(failures_in_window),
-                failed_attempts=len(failures_in_window),
+                attempt_count=_event_count(failures_in_window),
+                failed_attempts=_event_count(failures_in_window),
                 username=sorted(usernames)[0] if usernames else None,
                 window_seconds=int(lookback.total_seconds()),
             )
@@ -518,7 +578,7 @@ def detect_distributed_bruteforce(
                     None,
                     cluster,
                     f"{_count_word(len(ips), 'source IP')} failed authentication against the same username within {int(window.total_seconds())} seconds.",
-                    attempt_count=len(cluster),
+                    attempt_count=_event_count(cluster),
                     target_username=username,
                     source_ips=ips,
                     distinct_source_ips=len(ips),
@@ -745,7 +805,7 @@ def _detect_all(
             elif alert["rule"] == "ssh_root_login_attempt":
                 alert["description"] = f"{_count_word(attempts, 'failed attempt')} targeted root."
         alert["base_severity"] = alert["severity"]
-        for private_key in ("_merge_event_ids", "_merge_attempt_ids"):
+        for private_key in ("_merge_event_ids", "_merge_attempt_ids", "_merge_attempt_counts"):
             alert.pop(private_key, None)
     return kept, suppressed
 
@@ -757,6 +817,8 @@ def run_all_detections(
 ) -> list[dict[str, Any]]:
     """Run all rules and return their aggregated alerts."""
     alerts, _ = _detect_all(events, config, allowlist)
+    for alert in alerts:
+        alert.pop("_incident_event_counts", None)
     return alerts
 
 
@@ -811,6 +873,16 @@ def correlate_incidents(
                 }[severity]
             first = min(item["first_seen"] for item in bucket if item["first_seen"])
             last = max(item["last_seen"] for item in bucket if item["last_seen"])
+            event_counts: dict[Any, int] = {}
+            for item in bucket:
+                for identity, count in item.get("_incident_event_counts", {}).items():
+                    event_counts[identity] = max(event_counts.get(identity, 0), count)
+            usernames = sorted(
+                set().union(*(set(item.get("usernames_targeted", [])) for item in bucket))
+            )
+            authentication_methods = sorted(
+                set().union(*(set(item.get("authentication_methods", [])) for item in bucket))
+            )
             incidents.append(
                 {
                     "incident_id": f"INC-{len(incidents) + 1:03d}",
@@ -820,6 +892,9 @@ def correlate_incidents(
                     "contributing_rules": rules,
                     "combined_severity": severity,
                     "summary": f"{len(rules)} detection rules overlapped for {ip}: {', '.join(rules)}.",
+                    **({"attempt_count": sum(event_counts.values())} if event_counts else {}),
+                    "usernames_targeted": usernames,
+                    "authentication_methods": authentication_methods,
                     **({"risk_score": score, "risk_band": band} if band is not None else {}),
                 }
             )
@@ -848,7 +923,7 @@ def calculate_risk_scores(
             alert_rules[source_ip].add(alert["rule"])
     scores = {}
     for ip, ip_events in grouped.items():
-        failures = sum(_is_failure(e) for e in ip_events)
+        failures = sum(_event_occurrences(e) for e in ip_events if _is_failure(e))
         root = any(_is_failure(e) and e.get("username") == "root" for e in ip_events)
         success_after = bool(
             {"ssh_success_after_failures", "web_success_after_failures"} & alert_rules[ip]
@@ -867,7 +942,7 @@ def calculate_risk_scores(
             score = min(score, RISK_UNCONFIRMED_CAP)
         band = risk_band(score)
         scores[ip] = {"score": score, "band": band}
-    attempt_counts = {ip: len(ip_events) for ip, ip_events in grouped.items()}
+    attempt_counts = {ip: _event_count(ip_events) for ip, ip_events in grouped.items()}
     last_seen = {
         ip: max((get_event_time(event) for event in ip_events), default=datetime.min)
         for ip, ip_events in grouped.items()
@@ -903,9 +978,12 @@ def analyze_events(
             # Keep the original report keys as aliases for existing consumers.
             alert["risk_score"] = source_risk["score"]
             alert["risk_band"] = source_risk["band"]
+    incidents = correlate_incidents(alerts, risk_scores)
+    for alert in alerts:
+        alert.pop("_incident_event_counts", None)
     return {
         "alerts": alerts,
-        "incidents": correlate_incidents(alerts, risk_scores),
+        "incidents": incidents,
         "risk_scores": risk_scores,
         "alerts_suppressed": suppressed,
     }
