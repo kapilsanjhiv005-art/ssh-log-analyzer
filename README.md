@@ -122,8 +122,8 @@ sshlog-analyzer --file ./private-data/access.log --log-type web --format all
 
 ### Testing on real logs
 
-Obtain `OpenSSH_2k.log` yourself from [Loghub](https://github.com/logpai/loghub),
-check the dataset's terms of use, and place your local copy at
+Obtain `OpenSSH_2k.log` yourself from the [Loghub 2.0 OpenSSH 2k dataset](https://github.com/logpai/loghub-2.0/blob/main/2k_dataset/OpenSSH/OpenSSH_2k.log),
+review its [dataset license](https://github.com/logpai/loghub-2.0/blob/main/LICENSE), and place your local copy at
 `sample_logs/OpenSSH_2k.log`; this project does not download the file. That dataset
 uses yearless syslog timestamps from 2016, so run it with:
 
@@ -133,6 +133,10 @@ sshlog-analyzer --file .\sample_logs\OpenSSH_2k.log --year 2016 --format all
 
 The filename is ignored by Git so a real third-party log does not become project
 content. Review your local `git status` if that filename was tracked previously.
+Loghub 2.0's terms limit availability to research or academic work and require
+reference to its repository, with citation of the listed papers where applicable;
+include its notice in any copy and verify your intended use and any redistribution
+meet those terms. This project does not include or redistribute the dataset.
 
 For a read-only tail of appended SSH lines, use `--follow`. It starts at the current end of an existing file (or waits for a missing file), handles truncation/rotation, retains a bounded event window, and prints each alert once plus meaningful updates after five additional attempts; press Ctrl+C to stop.
 
@@ -210,3 +214,9 @@ Use this project for defensive log analysis only. Analyze only logs you own or a
 Install the pinned development extras with `python -m pip install -e '.[dev]'`. Run tests with `python -m pytest -v`, lint and formatting checks with `ruff check .` and `ruff format --check .`, and the 100,000-line synthetic benchmark with `python benchmark.py`. GitHub Actions runs lint, formatting, and tests on Python 3.11, 3.12, and 3.13.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for a short detection-rule walkthrough and [docs/OUTPUTS.md](docs/OUTPUTS.md) for report fields and exit-code details.
+
+## License
+
+The project source is distributed under the MIT License; see [LICENSE](LICENSE).
+Third-party datasets and dependencies have their own terms and are not relicensed
+by this project's MIT license.
