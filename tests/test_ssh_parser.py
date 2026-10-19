@@ -43,6 +43,7 @@ def test_loghub_auth_and_metadata_formats():
     assert events[1]["username"] == "guest"
     assert events[2]["event_type"] == "authentication_success"
     assert events[2]["source_ip"] == "203.0.113.4"
+    assert events[2]["authentication_method"] == "publickey"
     assert events[3]["username"] == "analyst"
     assert events[4]["event_type"] == "connection_closed"
     assert events[5]["event_type"] == "connection_closed"
@@ -119,3 +120,47 @@ def test_optional_loghub_sample_has_valid_parser_accounting():
         stats["events_parsed"] + stats["lines_ignored"] + stats["lines_malformed"]
         == stats["lines_read"]
     )
+
+
+def test_repeated_auth_message_is_parsed_as_weighted_occurrence():
+    line = (
+        "Oct 19 09:30:00 host sshd[1]: message repeated 5 times: "
+        "[ Failed password for analyst from 192.0.2.10 port 22 ssh2 ]"
+    )
+    event = parse_log_line(line, year=2026)
+
+    assert event is not None
+    assert event["event_type"] == "authentication_failure"
+    assert event["occurrence_count"] == 5
+    assert event["source_ip"] == "192.0.2.10"
+
+
+def test_repeated_auth_message_rejects_unbounded_count():
+    line = (
+        "Oct 19 09:30:00 host sshd[1]: message repeated 1000001 times: "
+        "[ Failed password for analyst from 192.0.2.10 port 22 ssh2 ]"
+    )
+    assert parse_log_line(line, year=2026) is None
+
+
+def test_parse_file_counts_repeated_malformed_and_ignored_lines(tmp_path):
+    path = tmp_path / "repeated.log"
+    path.write_text(
+        "Oct 19 09:30:00 host sshd[1]: Failed password for analyst from 192.0.2.10 port 22 ssh2\n"
+        "Oct 19 09:30:01 host sshd[1]: message repeated 5 times: "
+        "[ Failed password for analyst from 192.0.2.10 port 22 ssh2 ]\n"
+        "Oct 19 09:30:02 host sshd[2]: Failed password for analyst from nowhere\n"
+        "Oct 19 09:30:03 host systemd[1]: Started unrelated service\n",
+        encoding="utf-8",
+    )
+
+    events, stats = parse_log_file(path, year=2026)
+
+    assert [item["occurrence_count"] for item in events] == [1, 5]
+    assert sum(item["occurrence_count"] for item in events) == 6
+    assert stats == {
+        "lines_read": 4,
+        "events_parsed": 2,
+        "lines_ignored": 1,
+        "lines_malformed": 1,
+    }

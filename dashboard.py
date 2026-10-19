@@ -7,14 +7,14 @@ import ipaddress
 import json
 import os
 import tempfile
-from collections import Counter
-from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
-from analyzer import VERSION, _output_value, load_input
+from analyzer import VERSION, _output_value, load_input, render_csv
 from config import load_config
-from detections import analyze_events
+from detections import analyze_events, calculate_risk_scores, correlate_incidents
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SAMPLE_LOGS = {
@@ -110,11 +110,172 @@ def _attempts_by_hour(events: list[dict[str, Any]]) -> dict[datetime, int]:
             404,
         )
         if failed:
-            timestamp = event["timestamp"]
-            if not isinstance(timestamp, datetime):
-                timestamp = datetime.fromisoformat(timestamp)
-            counts[timestamp.replace(minute=0, second=0, microsecond=0)] += 1
+            timestamp = _as_datetime(event.get("timestamp"))
+            if timestamp is None:
+                continue
+            count = event.get("occurrence_count", 1)
+            counts[timestamp.replace(minute=0, second=0, microsecond=0)] += (
+                count if isinstance(count, int) and count > 0 else 1
+            )
     return dict(sorted(counts.items()))
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """Convert an available event timestamp to the parser's naive-UTC form."""
+    if value is None:
+        return None
+    try:
+        timestamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return timestamp
+
+
+def summarize_dashboard_metrics(
+    alerts: list[dict[str, Any]],
+    risk_scores: dict[str, dict[str, Any]],
+    incidents: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Summarize rule-severity alerts separately from unique source-risk bands."""
+    counts = Counter(alert.get("base_severity", alert.get("severity")) for alert in alerts)
+    return {
+        **{f"{severity.lower()}_alerts": counts.get(severity, 0) for severity in SEVERITIES},
+        "critical_risk_sources": sum(
+            risk.get("band") == "Critical" for risk in risk_scores.values()
+        ),
+        "incidents": len(incidents),
+    }
+
+
+def filter_dashboard_data(
+    events: list[dict[str, Any]],
+    result: dict[str, Any],
+    *,
+    source_ip: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    severities: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Filter dashboard views without modifying source events or analysis records."""
+    has_dates = start_date is not None or end_date is not None
+    start = datetime.combine(start_date, time.min) if start_date else None
+    end = datetime.combine(end_date, time.max) if end_date else None
+
+    def in_range(first_value: Any, last_value: Any = None) -> bool:
+        first = _as_datetime(first_value)
+        last = _as_datetime(last_value) or first
+        if first is None:
+            return not has_dates
+        return (end is None or first <= end) and (start is None or (last or first) >= start)
+
+    visible_events = [
+        event
+        for event in events
+        if (source_ip is None or event.get("source_ip") == source_ip)
+        and _as_datetime(event.get("timestamp")) is not None
+        and in_range(event.get("timestamp"))
+    ]
+    visible_alerts = []
+    for alert in result.get("alerts", []):
+        sources = {alert.get("source_ip"), *alert.get("source_ips", [])}
+        if source_ip is not None and source_ip not in sources:
+            continue
+        if (
+            severities is not None
+            and alert.get("base_severity", alert.get("severity")) not in severities
+        ):
+            continue
+        if in_range(alert.get("first_seen"), alert.get("last_seen")):
+            visible_alerts.append(dict(alert))
+
+    risk_scores = calculate_risk_scores(visible_events, visible_alerts)
+    for alert in visible_alerts:
+        source_risk = risk_scores.get(alert.get("source_ip"))
+        if source_risk:
+            alert["source_risk_score"] = source_risk["score"]
+            alert["source_risk_band"] = source_risk["band"]
+            alert["risk_score"] = source_risk["score"]
+            alert["risk_band"] = source_risk["band"]
+    filtered = dict(result)
+    filtered["alerts"] = visible_alerts
+    filtered["risk_scores"] = risk_scores
+    incidents = correlate_incidents(visible_alerts, risk_scores)
+    original_incidents = result.get("incidents", [])
+    for incident in incidents:
+        incident_rules = set(incident.get("contributing_rules", []))
+        matching_originals = [
+            original
+            for original in original_incidents
+            if original.get("source_ip") == incident.get("source_ip")
+            and incident_rules.issubset(set(original.get("contributing_rules", [])))
+            and _as_datetime(original.get("first_seen")) is not None
+            and _as_datetime(original.get("last_seen")) is not None
+            and _as_datetime(incident.get("first_seen")) is not None
+            and _as_datetime(incident.get("last_seen")) is not None
+            and _as_datetime(original.get("first_seen")) <= _as_datetime(incident.get("last_seen"))
+            and _as_datetime(original.get("last_seen")) >= _as_datetime(incident.get("first_seen"))
+        ]
+        if matching_originals:
+            incident["incident_id"] = matching_originals[0]["incident_id"]
+    for incident in incidents:
+        first = _as_datetime(incident.get("first_seen"))
+        last = _as_datetime(incident.get("last_seen"))
+        evidence = [
+            event
+            for event in visible_events
+            if event.get("source_ip") == incident["source_ip"]
+            and (stamp := _as_datetime(event.get("timestamp"))) is not None
+            and (first is None or stamp >= first)
+            and (last is None or stamp <= last)
+        ]
+        incident["attempt_count"] = sum(
+            event.get("occurrence_count", 1)
+            if isinstance(event.get("occurrence_count", 1), int)
+            and event.get("occurrence_count", 1) > 0
+            else 1
+            for event in evidence
+        )
+        incident["usernames_targeted"] = sorted(
+            {event["username"] for event in evidence if event.get("username")}
+        )
+        incident["authentication_methods"] = sorted(
+            {
+                event["authentication_method"]
+                for event in evidence
+                if event.get("authentication_method")
+            }
+        )
+    filtered["incidents"] = incidents
+    return visible_events, filtered
+
+
+def _root_and_username_summary(
+    events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Count targeted usernames and root outcomes from parsed authentication events."""
+    usernames: Counter[str] = Counter()
+    root = Counter()
+    for event in events:
+        if event.get("event_type") not in {"authentication_failure", "authentication_success"}:
+            continue
+        occurrence_count = event.get("occurrence_count", 1)
+        weight = (
+            occurrence_count if isinstance(occurrence_count, int) and occurrence_count > 0 else 1
+        )
+        username = event.get("username")
+        if username and event.get("event_type") == "authentication_failure":
+            usernames[username] += weight
+        if username == "root":
+            if event.get("event_type") == "authentication_failure":
+                root["failed"] += weight
+            else:
+                root["successful"] += weight
+    return (
+        [{"Username": name, "Failed attempts": count} for name, count in usernames.most_common(10)],
+        {"failed": root["failed"], "successful": root["successful"]},
+    )
 
 
 def _render_dashboard(st: Any) -> None:
@@ -145,8 +306,24 @@ def _render_dashboard(st: Any) -> None:
     with st.sidebar:
         st.header("Analysis settings")
         year = st.number_input("Year for SSH syslog timestamps", 1970, 2200, datetime.now().year)
-        threshold = st.slider("Key detection threshold", 1, 50, default_threshold)
-        window_seconds = st.slider("Detection window (seconds)", 1, 3600, 60)
+        threshold_label = (
+            "Brute-force threshold (failures)"
+            if log_type == "ssh"
+            else "Web login and scanning threshold (requests)"
+        )
+        threshold_help = (
+            "Minimum failed authentication events from one source in the configured window."
+            if log_type == "ssh"
+            else "Minimum matching login failures or 404 requests from one source in the configured window."
+        )
+        threshold = st.slider(threshold_label, 1, 50, default_threshold, help=threshold_help)
+        window_seconds = st.slider(
+            "Detection window (seconds)",
+            1,
+            3600,
+            60,
+            help="Time window used by the threshold-controlled detections.",
+        )
         allowlist_text = st.text_area(
             "Optional trusted IP/CIDR allowlist", placeholder="192.0.2.0/24"
         )
@@ -190,7 +367,7 @@ def _show_analysis(
     threshold: int,
     window_seconds: int,
 ) -> None:
-    """Analyze a selected local file and display summary, tables, and JSON."""
+    """Analyze a selected local file and show filterable SOC-style evidence."""
     try:
         events, parse_stats, result = analyze_for_dashboard(
             path,
@@ -205,80 +382,332 @@ def _show_analysis(
         st.error(f"Unable to analyze log: {error}")
         return
 
-    counts = Counter(alert["severity"] for alert in result["alerts"])
-    columns = st.columns(4)
-    for column, severity in zip(columns, SEVERITIES):
-        column.metric(severity, counts.get(severity, 0))
+    with st.sidebar:
+        all_sources = list(result["risk_scores"])
+        selected_source = st.selectbox(
+            "Source IP",
+            ["All sources", *all_sources],
+            help="Limit the dashboard to one source IP and its related alerts/incidents.",
+        )
+        date_selection = st.date_input(
+            "Date range (UTC)",
+            value=(),
+            help="Filter events and alert windows by the parser's UTC timestamps.",
+        )
+        start_date = end_date = None
+        if isinstance(date_selection, tuple):
+            if len(date_selection) == 2:
+                start_date, end_date = date_selection
+        elif isinstance(date_selection, date):
+            start_date = end_date = date_selection
+
+    selected_severity = st.multiselect(
+        "Filter by rule severity",
+        SEVERITIES,
+        default=list(SEVERITIES),
+        help="Filters alert counts by each detection rule's base severity.",
+    )
+    selected_ip = None if selected_source == "All sources" else selected_source
+    visible_events, visible_result = filter_dashboard_data(
+        events,
+        result,
+        source_ip=selected_ip,
+        start_date=start_date,
+        end_date=end_date,
+        severities=set(selected_severity),
+    )
+    visible_alerts = visible_result["alerts"]
+    visible_risks = visible_result["risk_scores"]
+    visible_incidents = visible_result["incidents"]
+    metrics = summarize_dashboard_metrics(visible_alerts, visible_risks, visible_incidents)
+
+    st.caption(
+        "Rule severity counts describe individual detections; source-risk counts are unique IPs. "
+        "Displayed event timestamps are UTC."
+    )
+    metric_columns = st.columns(6)
+    metric_labels = (
+        ("Critical alerts", "critical_alerts"),
+        ("High alerts", "high_alerts"),
+        ("Medium alerts", "medium_alerts"),
+        ("Low alerts", "low_alerts"),
+        ("Critical-risk sources", "critical_risk_sources"),
+        ("Incidents", "incidents"),
+    )
+    for column, (label, key) in zip(metric_columns, metric_labels):
+        column.metric(label, metrics[key])
+
+    st.subheader("Parser coverage (entire input file)")
+    lines_read = parse_stats.get("lines_read", 0)
+    parsed = parse_stats.get("events_parsed", 0)
+    effective_events = sum(
+        event.get("occurrence_count", 1)
+        if isinstance(event.get("occurrence_count", 1), int)
+        and event.get("occurrence_count", 1) > 0
+        else 1
+        for event in events
+    )
+    malformed = parse_stats.get("lines_malformed", 0)
+    ignored = parse_stats.get("lines_ignored", 0)
+    parsed_pct = (100.0 * parsed / lines_read) if lines_read else 0.0
+    malformed_pct = (100.0 * malformed / lines_read) if lines_read else 0.0
+    coverage_columns = st.columns(7)
+    for column, label, value in zip(
+        coverage_columns,
+        (
+            "Lines read",
+            "Parsed records",
+            "Effective events",
+            "Ignored lines",
+            "Malformed lines",
+            "Parsed lines",
+            "Malformed lines",
+        ),
+        (
+            lines_read,
+            parsed,
+            effective_events,
+            ignored,
+            malformed,
+            f"{parsed_pct:.1f}%",
+            f"{malformed_pct:.1f}%",
+        ),
+    ):
+        column.metric(label, value)
+    if lines_read and malformed_pct > 5:
+        st.warning(f"Malformed SSH/web records are {malformed_pct:.1f}% of input lines (over 5%).")
+    if lines_read == 0:
+        st.info("The selected log is empty.")
+    elif parsed == 0:
+        st.warning("No recognizable events were parsed; check the selected log type and format.")
+    elif not visible_alerts:
+        st.info("Events were parsed, but no alerts matched the current filters.")
+    st.caption(
+        "Parsed records count input lines that yielded an event; effective events include "
+        "OpenSSH repeated-message counts. Percentages use lines read as the denominator. "
+        "Ignored lines are outside the selected parser's event scope."
+    )
 
     st.subheader("Alerts")
-    selected_severity = st.multiselect("Filter by severity", SEVERITIES, default=list(SEVERITIES))
-    visible = [alert for alert in result["alerts"] if alert["severity"] in selected_severity]
+    visible_alerts = sorted(
+        visible_alerts,
+        key=lambda alert: (
+            -(visible_risks.get(alert.get("source_ip"), {}).get("score", -1)),
+            str(alert.get("first_seen") or ""),
+            str(alert.get("rule") or ""),
+        ),
+    )
     alert_rows = [
         {
-            "Rule": html.escape(str(alert["rule"]), quote=True),
-            "Base severity": html.escape(
-                str(alert.get("base_severity", alert["severity"])), quote=True
-            ),
-            "Source IP": html.escape(str(alert["source_ip"]), quote=True),
-            "First seen": html.escape(str(alert["first_seen"]), quote=True),
-            "Last seen": html.escape(str(alert["last_seen"]), quote=True),
-            "Attempts": alert["attempt_count"],
-            "Source risk score (composite)": alert.get(
-                "source_risk_score", alert.get("risk_score")
-            ),
-            "Source risk band (composite)": alert.get("source_risk_band", alert.get("risk_band")),
-            "Details": html.escape(alert["description"]),
+            "Rule": alert.get("rule"),
+            "Rule severity": alert.get("base_severity", alert.get("severity")),
+            "Source IP": alert.get("source_ip"),
+            "First seen (UTC)": alert.get("first_seen"),
+            "Last seen (UTC)": alert.get("last_seen"),
+            "Attempts": alert.get("attempt_count"),
+            "Source risk score": visible_risks.get(alert.get("source_ip"), {}).get("score"),
+            "Source risk band": visible_risks.get(alert.get("source_ip"), {}).get("band"),
+            "Usernames": ", ".join(alert.get("usernames_targeted", [])),
+            "Details": alert.get("description"),
         }
-        for alert in visible
+        for alert in visible_alerts
     ]
-    st.dataframe(alert_rows, width="stretch", hide_index=True)
+    st.dataframe(alert_rows, width="stretch", height=420, hide_index=True)
+
+    if selected_ip and selected_ip in visible_risks:
+        risk = visible_risks[selected_ip]
+        source_alerts = [
+            alert
+            for alert in visible_alerts
+            if alert.get("source_ip") == selected_ip or selected_ip in alert.get("source_ips", [])
+        ]
+        st.subheader(f"Source investigation: {html.escape(selected_ip)}")
+        st.write(f"Risk: {risk['score']}/100 ({risk['band']})")
+        st.write(
+            "Contributing rules: "
+            + (", ".join(sorted({a["rule"] for a in source_alerts})) or "None in current filters")
+        )
+        st.write(
+            "Incident history: "
+            + (
+                ", ".join(
+                    i["incident_id"] for i in visible_incidents if i["source_ip"] == selected_ip
+                )
+                or "None in current filters"
+            )
+        )
+
+    st.subheader("Incidents")
+    incident_rows = [
+        {
+            "Incident ID": incident["incident_id"],
+            "Source IP": incident["source_ip"],
+            "First seen (UTC)": incident["first_seen"],
+            "Last seen (UTC)": incident["last_seen"],
+            "Severity": incident["combined_severity"],
+            "Source risk": f"{incident.get('risk_score', 'n/a')}/100 {incident.get('risk_band', '')}",
+            "Rules": ", ".join(incident["contributing_rules"]),
+            "Attempts": incident.get("attempt_count", "n/a"),
+            "Usernames": ", ".join(incident.get("usernames_targeted", [])) or "n/a",
+            "Auth methods": ", ".join(incident.get("authentication_methods", []))
+            or "Not available in parsed events",
+        }
+        for incident in visible_incidents
+    ]
+    st.dataframe(incident_rows, width="stretch", height=240, hide_index=True)
+    if visible_incidents:
+        selected_id = st.selectbox(
+            "Incident details",
+            [item["incident_id"] for item in visible_incidents],
+            key="incident_selection",
+        )
+        incident = next(item for item in visible_incidents if item["incident_id"] == selected_id)
+        st.markdown(
+            f"**{html.escape(incident['incident_id'])} · {html.escape(incident['combined_severity'])}**  "
+            f"Source: `{html.escape(incident['source_ip'])}` · "
+            f"{html.escape(str(incident['first_seen']))} – {html.escape(str(incident['last_seen']))} UTC"
+        )
+        st.write(incident["summary"])
+    else:
+        st.info("No correlated incidents match the current filters.")
 
     st.subheader("Failed attempts over time")
-    hourly = _attempts_by_hour(events)
-    chart_data = {
-        "timestamp": [stamp for stamp in hourly],
-        "failed_attempts": list(hourly.values()),
-    }
-    st.line_chart(chart_data, x="timestamp", y="failed_attempts")
+    focus_options = {"All visible events": None}
+    for incident in visible_incidents:
+        focus_options[f"Incident {incident['incident_id']} ({incident['source_ip']})"] = (
+            incident["source_ip"],
+            incident["first_seen"],
+            incident["last_seen"],
+        )
+    for index, alert in enumerate(visible_alerts, start=1):
+        focus_options[
+            f"Alert {index}: {alert['rule']} ({alert.get('source_ip') or 'distributed'})"
+        ] = (alert.get("source_ip"), alert.get("first_seen"), alert.get("last_seen"))
+    focus_label = st.selectbox("Timeline scope", list(focus_options), key="timeline_scope")
+    focus = focus_options[focus_label]
+    chart_events = visible_events
+    if focus is not None:
+        focus_ip, focus_first, focus_last = focus
+        first = _as_datetime(focus_first)
+        last = _as_datetime(focus_last)
+        chart_events = [
+            event
+            for event in visible_events
+            if (focus_ip is None or event.get("source_ip") == focus_ip)
+            and (stamp := _as_datetime(event.get("timestamp"))) is not None
+            and (first is None or stamp >= first)
+            and (last is None or stamp <= last)
+        ]
+    hourly = _attempts_by_hour(chart_events)
+    if hourly:
+        log_scale = st.checkbox("Logarithmic attempt scale", value=False)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            figure, axis = plt.subplots(figsize=(10, 3.5), constrained_layout=True)
+            axis.plot(list(hourly), list(hourly.values()), marker="o", color="#48a9a6")
+            axis.set_xlabel("Timestamp (UTC hour)")
+            axis.set_ylabel("Failed attempts")
+            if log_scale:
+                axis.set_yscale("log")
+            st.pyplot(figure)
+            plt.close(figure)
+
+            by_source: dict[str, Counter[datetime]] = defaultdict(Counter)
+            for event in chart_events:
+                failed = event.get("event_type") == "authentication_failure" or event.get(
+                    "status"
+                ) in (401, 403, 404)
+                if not failed or not event.get("source_ip"):
+                    continue
+                stamp = _as_datetime(event.get("timestamp"))
+                if stamp is not None:
+                    hour = stamp.replace(minute=0, second=0, microsecond=0)
+                    weight = event.get("occurrence_count", 1)
+                    by_source[event["source_ip"]][hour] += (
+                        weight if isinstance(weight, int) and weight > 0 else 1
+                    )
+            top_ips = [
+                ip
+                for ip, _ in sorted(
+                    by_source.items(), key=lambda pair: (-sum(pair[1].values()), pair[0])
+                )[:5]
+            ]
+            if top_ips:
+                figure, axis = plt.subplots(figsize=(10, 4), constrained_layout=True)
+                for ip in top_ips:
+                    axis.plot(
+                        sorted(by_source[ip]),
+                        [by_source[ip][hour] for hour in sorted(by_source[ip])],
+                        marker=".",
+                        label=ip,
+                    )
+                axis.set_xlabel("Timestamp (UTC hour)")
+                axis.set_ylabel("Failed attempts")
+                axis.legend(loc="best")
+                st.pyplot(figure)
+                plt.close(figure)
+        except ImportError:
+            st.line_chart(
+                {"timestamp": list(hourly), "failed_attempts": list(hourly.values())},
+                x="timestamp",
+                y="failed_attempts",
+            )
+    else:
+        st.info("No timestamped failed attempts are available for the current filters.")
 
     st.subheader("Top source IPs and risk")
-    risk_rows = (
-        "".join(
-            "<tr>"
-            f"<td>{html.escape(ip, quote=True)}</td>"
-            f"<td>{risk['score']}/100</td>"
-            f"<td>{risk_band_badge(risk['band'])}</td>"
-            "</tr>"
-            for ip, risk in list(result["risk_scores"].items())[:10]
-        )
-        or '<tr><td colspan="3">No source IPs.</td></tr>'
-    )
-    st.markdown(
-        "<table><thead><tr><th>Source IP</th><th>Risk score</th><th>Band</th></tr></thead>"
-        f"<tbody>{risk_rows}</tbody></table>",
-        unsafe_allow_html=True,
+    risk_rows = [
+        {"Source IP": ip, "Risk score": risk["score"], "Risk band": risk_band_badge(risk["band"])}
+        for ip, risk in list(visible_risks.items())[:10]
+    ]
+    st.dataframe(
+        [
+            {**row, "Risk band": row["Risk band"].replace("<", "&lt;").replace(">", "&gt;")}
+            for row in risk_rows
+        ],
+        width="stretch",
+        hide_index=True,
     )
 
-    st.subheader("Incident drill-down")
-    incidents = result["incidents"]
-    if incidents:
-        selected_incident = st.selectbox(
-            "Select incident",
-            incidents,
-            format_func=lambda incident: (
-                f"{incident['incident_id']} · {incident['combined_severity']} · "
-                f"{incident['source_ip']}"
-            ),
-        )
-        st.json(_output_value(selected_incident))
-    else:
-        st.info("No correlated incidents.")
+    username_rows, root_counts = _root_and_username_summary(visible_events)
+    st.subheader("Username and root-login analytics")
+    st.dataframe(username_rows, width="stretch", hide_index=True)
+    st.write(
+        f"Failed root attempts: {root_counts['failed']} · Successful root logins: {root_counts['successful']}"
+    )
 
-    st.subheader("Parser coverage")
-    st.json(parse_stats)
-    payload = json.dumps(_output_value(result), indent=2, ensure_ascii=False)
-    st.download_button(
-        "Download JSON report", payload, file_name="alerts.json", mime="application/json"
+    success_alerts = [
+        alert
+        for alert in visible_alerts
+        if alert.get("rule") in {"ssh_success_after_failures", "web_success_after_failures"}
+    ]
+    if success_alerts:
+        strongest = max(success_alerts, key=lambda alert: alert.get("attempt_count", 0))
+        st.warning(
+            "Potential compromise indicator: successful authentication was observed after "
+            f"{strongest.get('attempt_count', 0)} failed attempts from "
+            f"{html.escape(str(strongest.get('source_ip') or 'the same source'))}. "
+            "This sequence is suspicious activity, not confirmation of compromise."
+        )
+
+    payload = json.dumps(_output_value(visible_result), indent=2, ensure_ascii=False)
+    csv_payload = render_csv(visible_alerts)
+    from html_report import render_html_report
+
+    html_payload = render_html_report(visible_events, visible_result)
+    download_columns = st.columns(3)
+    download_columns[0].download_button(
+        "Download filtered JSON", payload, file_name="alerts.json", mime="application/json"
+    )
+    download_columns[1].download_button(
+        "Download filtered CSV", csv_payload, file_name="alerts.csv", mime="text/csv"
+    )
+    download_columns[2].download_button(
+        "Download filtered HTML", html_payload, file_name="report.html", mime="text/html"
     )
 
 

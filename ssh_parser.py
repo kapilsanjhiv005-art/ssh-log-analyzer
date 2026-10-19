@@ -34,6 +34,10 @@ PAM_FAILURE = re.compile(
 )
 PAM_USER = re.compile(r"(?:^|\s)user=(?P<username>\S+)")
 IP_ONLY = re.compile(r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]*:[0-9a-fA-F:]+)")
+REPEATED_MESSAGE = re.compile(
+    r"^message repeated (?P<count>\d+) times:\s*\[(?P<message>.*)\]$", re.IGNORECASE
+)
+MAX_REPEATED_OCCURRENCES = 1_000_000
 
 
 def _event(
@@ -45,6 +49,8 @@ def _event(
     port: str | None,
     event_type: str,
     invalid_user: bool = False,
+    occurrence_count: int = 1,
+    authentication_method: str | None = None,
 ) -> dict[str, Any]:
     """Build the stable event shape used by detection rules."""
     return {
@@ -57,6 +63,8 @@ def _event(
         "event_type": event_type,
         "invalid_user": invalid_user,
         "is_root": username == "root",
+        "occurrence_count": occurrence_count,
+        "authentication_method": authentication_method,
     }
 
 
@@ -91,6 +99,13 @@ def parse_log_line(line: str, year: int | None = None) -> dict[str, Any] | None:
             return None
 
     message = values["message"]
+    occurrence_count = 1
+    repeated = REPEATED_MESSAGE.match(message)
+    if repeated:
+        occurrence_count = int(repeated.group("count"))
+        if not 1 <= occurrence_count <= MAX_REPEATED_OCCURRENCES:
+            return None
+        message = repeated.group("message").strip()
     common = (timestamp, values["hostname"], values.get("pid"))
     auth = AUTH.match(message)
     if auth:
@@ -106,6 +121,8 @@ def parse_log_line(line: str, year: int | None = None) -> dict[str, Any] | None:
             if record["result"].lower() == "accepted"
             else "authentication_failure",
             bool(record["invalid"]),
+            occurrence_count=occurrence_count,
+            authentication_method=record["method"],
         )
 
     invalid = INVALID_USER.match(message)
@@ -114,7 +131,13 @@ def parse_log_line(line: str, year: int | None = None) -> dict[str, Any] | None:
         if not _valid_ip(record["ip"]):
             return None
         return _event(
-            *common, record["username"], record["ip"], None, "authentication_failure", True
+            *common,
+            record["username"],
+            record["ip"],
+            None,
+            "authentication_failure",
+            True,
+            occurrence_count=occurrence_count,
         )
 
     pam = PAM_FAILURE.search(message)
@@ -124,17 +147,38 @@ def parse_log_line(line: str, year: int | None = None) -> dict[str, Any] | None:
             return None
         user_match = PAM_USER.search(message)
         username = record.get("username") or (user_match.group("username") if user_match else None)
-        return _event(*common, username, record["ip"], None, "authentication_failure")
+        return _event(
+            *common,
+            username,
+            record["ip"],
+            None,
+            "authentication_failure",
+            occurrence_count=occurrence_count,
+        )
 
     lowered = message.lower()
     if "connection closed by" in lowered or "received disconnect from" in lowered:
         found = IP_ONLY.search(message)
         if found:
-            return _event(*common, None, found.group("ip"), None, "connection_closed")
+            return _event(
+                *common,
+                None,
+                found.group("ip"),
+                None,
+                "connection_closed",
+                occurrence_count=occurrence_count,
+            )
     if "reverse mapping checking getaddrinfo" in lowered and "possible break-in attempt" in lowered:
         found = IP_ONLY.search(message)
         if found:
-            return _event(*common, None, found.group("ip"), None, "suspicious_reverse_mapping")
+            return _event(
+                *common,
+                None,
+                found.group("ip"),
+                None,
+                "suspicious_reverse_mapping",
+                occurrence_count=occurrence_count,
+            )
     return None
 
 
