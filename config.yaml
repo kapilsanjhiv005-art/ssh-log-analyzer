@@ -1,0 +1,51 @@
+brute_force:
+  threshold: 5
+  window_seconds: 60
+password_spraying:
+  username_threshold: 5
+  window_seconds: 60
+username_enumeration:
+  threshold: 4
+  window_seconds: 60
+distributed_bruteforce:
+  ip_threshold: 5
+  window_seconds: 120
+root_attempts:
+  minimum_attempts: 3
+  window_seconds: 60
+alert_merging:
+  # null uses each detection rule's own time window
+  merge_gap_seconds: null
+severity_thresholds:
+  # Brute-force and root-targeting alerts become High at this merged count.
+  high_attempts: 50
+  # At this count the High alert description calls the activity sustained.
+  sustained_attempts: 200
+success_after_failures:
+  failure_threshold: 5
+  lookback_seconds: 300
+new_source_ip:
+  # Used only by ssh_new_source_ip_login; does not suppress other detections.
+  trusted_local_sources:
+    - 127.0.0.1/32
+    - ::1/128
+off_hours:
+  business_start: "08:00"
+  business_end: "19:00"
+web:
+  login_paths:
+    - /login
+    - /wp-login.php
+    - /admin
+  login_threshold: 5
+  login_window_seconds: 60
+  scanning_404_threshold: 10
+  scanning_window_seconds: 60
+  suspicious_user_agents:
+    - sqlmap
+    - nikto
+    - nmap
+    - masscan
+    - acunetix
+  user_agent_window_seconds: 60
+  success_after_failures_threshold: 5

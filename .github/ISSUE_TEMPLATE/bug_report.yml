@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible issue without sharing sensitive log data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Never attach real logs, credentials, tokens, public IPs, internal hostnames,
+        or personal data. Use documentation-range IPs and synthetic or sanitized examples.
+  - type: input
+    id: version
+    attributes:
+      label: Analyzer version
+      placeholder: 0.4.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Python version and operating system
+      placeholder: Python 3.13, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include commands and a small synthetic or sanitized example only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized-output
+    attributes:
+      label: Sanitized error or output
+      description: Remove usernames, hostnames, real IP addresses, and other sensitive values.
+    validations:
+      required: false

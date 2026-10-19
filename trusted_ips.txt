@@ -1,0 +1,2 @@
+# Add trusted source IP addresses or CIDR ranges, one per line.
+# Example documentation-only network: 192.0.2.0/24
