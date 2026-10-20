@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Sentinel analysis sparkle</title>
+  <defs>
+    <linearGradient id="sentinel-spectrum" x1="8" y1="56" x2="56" y2="8" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35E0C1"/>
+      <stop offset=".52" stop-color="#36D7F5"/>
+      <stop offset="1" stop-color="#9B7BFF"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 3.5 38.2 24 58.5 32 38.2 40 32 60.5 25.8 40 5.5 32 25.8 24 32 3.5Z" fill="url(#sentinel-spectrum)"/>
+  <path d="M49 5.5 51.1 12.4 58 14.5 51.1 16.6 49 23.5 46.9 16.6 40 14.5 46.9 12.4 49 5.5Z" fill="#EDF4FF"/>
+  <circle cx="11" cy="12" r="2.5" fill="#36D7F5"/>
+</svg>

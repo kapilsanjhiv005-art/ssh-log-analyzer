@@ -55,14 +55,42 @@ def test_combined_parser_fields_timezone_and_stats(tmp_path):
         "events_parsed": 1,
         "lines_ignored": 1,
         "lines_malformed": 1,
+        "malformed_by_reason": {"unsupported_or_truncated_format": 1},
+        "effective_event_occurrences": 1,
     }
+
+
+def test_web_malformed_reason_counts_and_bounded_samples(tmp_path):
+    log = tmp_path / "malformed-access.log"
+    log.write_text(
+        '192.0.2.1 - - [19/Oct/2026:08:00:00 +0000] "GET / HTTP/1.1" 200 5 "-" "agent"\n'
+        "not a combined log record\n"
+        '999.0.0.1 - - [19/Oct/2026:08:00:00 +0000] "GET / HTTP/1.1" 200 5 "-" "agent"\n',
+        encoding="utf-8",
+    )
+
+    _, stats = parse_web_log_file(log, include_malformed_records=True)
+
+    assert stats["malformed_by_reason"] == {"unsupported_or_truncated_format": 1, "invalid_ip": 1}
+    assert [row["line_number"] for row in stats["malformed_records"]] == [2, 3]
+
+
+def test_web_parser_rejects_unbounded_numeric_fields_without_crashing():
+    line = (
+        '192.0.2.1 - - [19/Oct/2026:08:00:00 +0000] "GET / HTTP/1.1" 200 '
+        + ("9" * 5000)
+        + ' "-" "agent"'
+    )
+
+    assert parse_web_log_line(line) is None
 
 
 def test_web_login_bruteforce_positive_below_window_and_allowlist():
     events = [request(i * 5) for i in range(5)]
     alert = detect_web_login_bruteforce(events)[0]
     assert alert["rule"] == "web_login_bruteforce"
-    assert alert["mitre_attack_id"] == "T1110"
+    assert alert["mitre_attack_id"] is None
+    assert "do not prove authentication attempts" in alert["mitre_mapping_note"]
     assert alert["path"] == ["/login"]
     assert detect_web_login_bruteforce(events[:4]) == []
     outside = [request(i * 70) for i in range(5)]
@@ -152,3 +180,17 @@ def test_web_success_after_failures_is_critical_and_allowlist_suppresses():
     suppressed = analyze_events(events, allowlist=trusted, log_type="web")
     assert not suppressed["alerts"]
     assert suppressed["alerts_suppressed"] > 0
+
+
+def test_web_authentication_response_signals_do_not_claim_confirmed_attck_techniques():
+    login_alerts = detect_web_login_bruteforce([request(i, status=401) for i in range(5)])
+    success_events = [request(i, status=401) for i in range(5)] + [request(10, status=200)]
+    success_result = analyze_events(success_events, log_type="web")
+    success_alert = next(
+        item for item in success_result["alerts"] if item["rule"] == "web_success_after_failures"
+    )
+
+    assert login_alerts[0]["mitre_attack_id"] is None
+    assert "do not prove authentication attempts" in login_alerts[0]["mitre_mapping_note"]
+    assert success_alert["mitre_attack_id"] is None
+    assert "does not confirm authentication" in success_alert["mitre_mapping_note"]

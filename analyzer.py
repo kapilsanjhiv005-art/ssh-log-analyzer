@@ -24,6 +24,8 @@ from threading import Event
 
 from config import load_allowlist, load_config
 from detections import analyze_events
+from event_accounting import effective_event_occurrences
+from investigation import build_successful_login_rows
 from ssh_parser import parse_log_file, parse_log_line
 from web_parser import parse_web_log_file, parse_web_log_line
 
@@ -34,13 +36,38 @@ from web_parser import parse_web_log_file, parse_web_log_line
 DEFAULT_LOG = Path("sample_logs/auth.log")
 DEFAULT_REPORT_DIR = Path("reports")
 VERSION = "0.4.0"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 SEVERITY_ORDER = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
 
 
 # ============================================================
 # REPORT GENERATION
 # ============================================================
+
+
+def timestamp_interpretation(log_type: str, year: int) -> dict[str, object]:
+    """Describe the year and timezone semantics used for parsed timestamps."""
+    if log_type == "ssh":
+        return {
+            "year_for_yearless_timestamps": year,
+            "timezone_assumption": (
+                "timezone-unspecified for SSH syslog timestamps without an explicit offset; "
+                "no host timezone is inferred."
+            ),
+            "offset_timestamp_policy": (
+                "ISO timestamps with explicit offsets are normalized to UTC; "
+                "timezone-naive timestamps remain timezone-naive."
+            ),
+        }
+    if log_type == "web":
+        return {
+            "year_for_yearless_timestamps": None,
+            "timezone_assumption": (
+                "Nginx/Apache combined timestamps include an explicit numeric offset."
+            ),
+            "offset_timestamp_policy": "Explicit offsets are normalized to UTC.",
+        }
+    raise ValueError(f"Unsupported log type: {log_type}")
 
 
 def _output_value(value):
@@ -76,7 +103,7 @@ def _safe_csv_cell(value):
     return value
 
 
-def render_csv(alerts):
+def render_csv(alerts, timestamp_interpretation=None):
     """Serialize alerts to CSV using the same safe fields as file exports."""
     import io
 
@@ -101,17 +128,62 @@ def render_csv(alerts):
         ]
     else:
         fieldnames = list(dict.fromkeys(key for alert in alerts for key in alert.keys()))
+    rows = [dict(alert) for alert in alerts]
+    if timestamp_interpretation is not None:
+        if "timestamp_interpretation" not in fieldnames:
+            fieldnames.append("timestamp_interpretation")
+        metadata = json.dumps(timestamp_interpretation, sort_keys=True)
+        for row in rows:
+            row["timestamp_interpretation"] = metadata
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(_safe_csv_cell(_output_value(alert)) for alert in alerts)
+    writer.writerows(_safe_csv_cell(_output_value(alert)) for alert in rows)
     return output.getvalue()
 
 
-def export_csv(alerts, output_path):
+def export_csv(alerts, output_path, *, timestamp_interpretation=None):
     """Export security alerts to a CSV file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(render_csv(alerts), encoding="utf-8", newline="")
+    output_path.write_text(
+        render_csv(alerts, timestamp_interpretation), encoding="utf-8", newline=""
+    )
+    return output_path
+
+
+SUCCESSFUL_LOGIN_CSV_FIELDS = (
+    "timestamp",
+    "source_ip",
+    "username",
+    "hostname",
+    "process_id",
+    "session_identifier",
+    "duration_seconds",
+    "related_failures",
+    "related_alert_rules",
+    "correlation_status",
+    "data_quality_limitations",
+    "occurrence_count",
+)
+
+
+def render_successful_logins_csv(successful_logins):
+    """Serialize successful-login evidence separately from alert rows."""
+    import io
+
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=SUCCESSFUL_LOGIN_CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(_safe_csv_cell(_output_value(row)) for row in successful_logins)
+    return output.getvalue()
+
+
+def export_successful_logins_csv(successful_logins, output_path):
+    """Write the successful-login inventory to its own CSV artifact."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        render_successful_logins_csv(successful_logins), encoding="utf-8", newline=""
+    )
     return output_path
 
 
@@ -136,14 +208,58 @@ def print_summary(events, result, parse_stats):
     print("=" * 72)
 
     print(f"Log events analyzed            : {len(events)}")
-    effective_count = sum(
-        event.get("occurrence_count", 1)
-        if isinstance(event.get("occurrence_count", 1), int)
-        and event.get("occurrence_count", 1) > 0
-        else 1
-        for event in events
+    effective_count = parse_stats.get(
+        "effective_event_occurrences", effective_event_occurrences(events)
     )
     print(f"Effective event occurrences    : {effective_count}")
+    if "authentication_failures" in parse_stats:
+        print(
+            "Effective authentication attempts: "
+            f"{parse_stats.get('effective_authentication_attempts', 0)}"
+        )
+        print(f"Authentication failures (all)   : {parse_stats['authentication_failures']}")
+        print(
+            "Password failures              : "
+            f"{parse_stats.get('password_authentication_failures', 0)}"
+        )
+        print(
+            f"Authentication-method probes   : {parse_stats.get('authentication_method_probes', 0)}"
+        )
+        print(f"Authentication successes       : {parse_stats['authentication_successes']}")
+        print(f"Root failures (all methods)     : {parse_stats['root_authentication_failures']}")
+        print(
+            "Root password failures         : "
+            f"{parse_stats.get('root_password_authentication_failures', 0)}"
+        )
+        print(f"Root authentication successes   : {parse_stats['root_authentication_successes']}")
+        print(
+            "Authentication context records : "
+            f"{parse_stats.get('authentication_context_records', 0)}"
+        )
+        context_categories = parse_stats.get("authentication_context_categories", {})
+        record_categories = parse_stats.get("parsed_record_categories", {})
+        print(
+            "Invalid-user / PAM / sshd-request context: "
+            f"{context_categories.get('invalid_user', 0)} / "
+            f"{context_categories.get('pam_authentication_failure', 0)} / "
+            f"{context_categories.get('input_userauth_request', 0)}"
+        )
+        print(
+            "Connection / identification records: "
+            f"{record_categories.get('connection_closed', 0)} / "
+            f"{record_categories.get('identification_missing', 0)}"
+        )
+        print(
+            f"Context records linked         : {parse_stats.get('supporting_evidence_records', 0)}"
+        )
+        print(
+            "Unattributed context records   : "
+            f"{parse_stats.get('unattributed_contextual_records', 0)}"
+        )
+        print(
+            "Unresolved/ambiguous context   : "
+            f"{parse_stats.get('unresolved_or_ambiguous_context_records', 0)}"
+        )
     print(f"Security alerts generated      : {len(alerts)}")
     print(
         "Parser coverage                : "
@@ -183,6 +299,13 @@ def print_summary(events, result, parse_stats):
             if incident.get("risk_score") is not None:
                 print(f"    Source risk: {incident['risk_score']}/100 {incident['risk_band']}")
             print(f"    Summary    : {incident['summary']}")
+            for session in incident.get("session_activity", []):
+                print(
+                    "    SSH session context: "
+                    f"{session['event_type']} for {session['username']} on "
+                    f"{session['hostname']} (sshd PID {session['process_id']}) "
+                    f"at {session['timestamp']}"
+                )
 
     print("\nALERT DETAILS")
     print("-" * 72)
@@ -202,6 +325,12 @@ def print_summary(events, result, parse_stats):
                 )
             print(f"    Usernames  : {', '.join(alert['usernames_targeted']) or '(none)'}")
             print(f"    Description: {alert['description']}")
+            for session in alert.get("session_activity", []):
+                print(
+                    "    SSH session: "
+                    f"opened for {session['username']} on {session['hostname']} "
+                    f"(sshd PID {session['process_id']}) at {session['timestamp']}"
+                )
             print(f"    ATT&CK     : {alert['mitre_attack_id']} - {alert['mitre_technique_name']}")
             print(f"    Action     : {alert['recommended_action']}")
 
@@ -219,16 +348,43 @@ def print_summary(events, result, parse_stats):
 # ============================================================
 
 
-def load_input(path: str | Path, log_type: str, year: int):
+def load_input(
+    path: str | Path,
+    log_type: str,
+    year: int,
+    *,
+    include_malformed_records: bool = False,
+):
     """Validate the input path and parse it using its selected log format."""
     log_path = Path(path)
     if not log_path.is_file():
         raise FileNotFoundError(f"Log file not found: {log_path}")
     if log_type == "ssh":
-        return parse_log_file(log_path, year=year)
+        return parse_log_file(
+            log_path, year=year, include_malformed_records=include_malformed_records
+        )
     if log_type == "web":
-        return parse_web_log_file(log_path)
+        return parse_web_log_file(log_path, include_malformed_records=include_malformed_records)
     raise ValueError(f"Unsupported log type: {log_type}")
+
+
+def print_malformed_summary(parse_stats: dict, *, output=print, sample_limit: int = 50) -> None:
+    """Print grouped malformed counts and bounded line-number-only samples."""
+    reasons = parse_stats.get("malformed_by_reason", {})
+    records = parse_stats.get("malformed_records", [])
+    output("\nMALFORMED INPUT SUMMARY")
+    if not reasons:
+        output("No malformed records.")
+        return
+    for reason, count in sorted(reasons.items()):
+        output(f"{reason}: {count}")
+    for record in records[:sample_limit]:
+        output(f"  line {record['line_number']}: {record['reason']}")
+    omitted = max(0, len(records) - sample_limit) + parse_stats.get(
+        "malformed_records_truncated", 0
+    )
+    if omitted:
+        output(f"  {omitted} additional malformed record locations omitted")
 
 
 def _filter_result(result, min_severity):
@@ -294,6 +450,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--follow", action="store_true", help="Watch appended log lines for new alerts."
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress console report output.")
+    parser.add_argument(
+        "--show-malformed",
+        action="store_true",
+        help="Show grouped malformed-line reasons and up to 50 line numbers (no raw log text).",
+    )
     parser.add_argument("--version", action="version", version=f"sshlog-analyzer {VERSION}")
     return parser
 
@@ -462,7 +623,12 @@ def main(argv: list[str] | None = None) -> int:
                 log_type=args.log_type,
             )
             return 0
-        events, parse_stats = load_input(args.file, args.log_type, args.year)
+        events, parse_stats = load_input(
+            args.file,
+            args.log_type,
+            args.year,
+            include_malformed_records=args.show_malformed,
+        )
         result = analyze_events(events, config=config, allowlist=allowlist, log_type=args.log_type)
         result = _filter_result(result, args.min_severity)
         result["config_used"] = config
@@ -470,10 +636,27 @@ def main(argv: list[str] | None = None) -> int:
         result["version"] = VERSION
         result["schema_version"] = SCHEMA_VERSION
         result["generated_at"] = datetime.now(timezone.utc).isoformat()
+        result["timestamp_interpretation"] = timestamp_interpretation(args.log_type, args.year)
+        result["successful_logins"] = (
+            build_successful_login_rows(
+                events,
+                result["alerts"],
+                lookback_seconds=config["success_after_failures"]["lookback_seconds"],
+            )
+            if args.log_type == "ssh"
+            else []
+        )
 
         output_dir = Path(args.output_dir)
         if args.format in ("csv", "all"):
-            export_csv(result["alerts"], output_dir / "alerts.csv")
+            export_csv(
+                result["alerts"],
+                output_dir / "alerts.csv",
+                timestamp_interpretation=result["timestamp_interpretation"],
+            )
+            export_successful_logins_csv(
+                result["successful_logins"], output_dir / "successful_logins.csv"
+            )
         if args.format in ("json", "all"):
             export_json(result, output_dir / "alerts.json")
         if args.format in ("html", "all"):
@@ -483,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.format in ("console", "all") and not args.quiet:
             print_summary(events, result, parse_stats)
             print(f"\nReports directory: {output_dir}")
+        if args.show_malformed and not args.quiet:
+            print_malformed_summary(parse_stats)
         return _exit_code(result)
     except SystemExit as error:
         return int(error.code or 0)
