@@ -1,0 +1,2 @@
+Oct 19 09:00:00 synthetic-host sshd[1001]: Failed password for root from 192.0.2.40 port 44040 ssh2
+Oct 19 09:00:04 synthetic-host sshd[1001]: message repeated 4 times: [ Failed password for root from 192.0.2.40 port 44040 ssh2 ]

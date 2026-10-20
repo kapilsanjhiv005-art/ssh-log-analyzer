@@ -81,3 +81,90 @@ def test_incident_evidence_fields_are_rendered_and_escaped():
     assert "password" in document
     assert "<script>alert(1)</script>" not in document
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in document
+
+
+def test_html_report_includes_timestamp_interpretation():
+    report = render_html_report(
+        [],
+        {
+            "alerts": [],
+            "incidents": [],
+            "timestamp_interpretation": {
+                "year_for_yearless_timestamps": 2016,
+                "timezone_assumption": "timezone-unspecified SSH syslog timestamps",
+                "offset_timestamp_policy": "timestamps with explicit offsets are normalized to UTC",
+            },
+        },
+    )
+
+    assert "Timestamp interpretation" in report
+    assert "timezone-unspecified SSH syslog timestamps" in report
+    assert "normalized to UTC" in report
+
+
+def test_html_report_includes_escaped_successful_login_evidence():
+    username = "<script>login()</script>"
+    report = render_html_report(
+        [],
+        {
+            "alerts": [],
+            "incidents": [],
+            "risk_explanations": {
+                "192.0.2.70": {
+                    "score": 40,
+                    "band": "Medium",
+                    "factors": {
+                        "root_targeting": {
+                            "evidence": 1,
+                            "contribution": 15,
+                            "policy": "Add points when root failure is observed.",
+                        }
+                    },
+                    "confidence": {"rationale": "not a calibrated probability"},
+                    "uncertainty": "shared NAT may group unrelated users",
+                }
+            },
+            "successful_logins": [
+                {
+                    "timestamp": "2016-12-10T09:32:20",
+                    "source_ip": "192.0.2.70",
+                    "username": username,
+                    "duration_seconds": 766,
+                    "session_identifier": None,
+                    "data_quality_limitations": ["unknown session ID"],
+                }
+            ],
+        },
+    )
+
+    assert username not in report
+    assert "&lt;script&gt;login()&lt;/script&gt;" in report
+    assert "Successful logins" in report
+    assert "766" in report
+    assert "Source-risk explanations" in report
+    assert "shared NAT may group unrelated users" in report
+
+
+def test_html_summary_distinguishes_password_failures_and_none_probes():
+    html = render_html_report(
+        [],
+        {
+            "alerts": [],
+            "incidents": [],
+            "risk_scores": {},
+            "parse_stats": {
+                "lines_read": 2,
+                "events_parsed": 2,
+                "authentication_failures": 2,
+                "password_authentication_failures": 1,
+                "authentication_method_probes": 1,
+                "authentication_successes": 0,
+                "root_authentication_failures": 1,
+                "root_password_authentication_failures": 0,
+                "root_authentication_successes": 0,
+            },
+        },
+    )
+
+    assert "1 password failures" in html
+    assert "1 Failed none probes" in html

@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta
 from typing import Any
 
 from config import DEFAULT_CONFIG, is_allowlisted, is_trusted_source, load_config
+from event_accounting import event_occurrences
 
 BRUTE_FORCE_THRESHOLD = 5
 PASSWORD_SPRAY_THRESHOLD = 5
@@ -30,21 +31,45 @@ RISK_UNCONFIRMED_CAP = 74  # Prevent Critical scores without a confirmed success
 SEVERITY_ORDER = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
 RISK_BANDS = ((75, "Critical"), (50, "High"), (25, "Medium"), (0, "Low"))
 
+MITRE_MAPPING_NOTES = {
+    "ssh_password_spraying": (
+        "No technique assigned: distinct failed usernames do not establish that one password "
+        "was tried across accounts."
+    ),
+    "ssh_username_enumeration": (
+        "No technique assigned: invalid-user attempts show probing behavior, not confirmed "
+        "account discovery."
+    ),
+    "web_login_bruteforce": (
+        "No technique assigned: repeated 401/403 responses on a configured login path do not "
+        "prove authentication attempts."
+    ),
+    "web_success_after_failures": (
+        "No technique assigned: a 2xx response after 401/403 responses does not confirm "
+        "authentication or a valid account."
+    ),
+}
+
 RULE_INFO = {
     "ssh_brute_force": (
         "T1110.001",
         "Password Guessing",
         "Block the source IP at the firewall and review logs for other hosts",
     ),
+    "ssh_low_and_slow_bruteforce": (
+        "T1110.001",
+        "Password Guessing",
+        "Review the source activity over the longer window and tune a local allowlist if approved",
+    ),
     "ssh_password_spraying": (
-        "T1110.003",
-        "Password Spraying",
-        "Block the source IP and review targeted accounts",
+        None,
+        None,
+        "Review the source activity across accounts; do not infer a shared password",
     ),
     "ssh_username_enumeration": (
-        "T1087",
-        "Account Discovery",
-        "Block the source IP and review account exposure",
+        None,
+        None,
+        "Review invalid-user probes; the observed records do not confirm account discovery",
     ),
     "ssh_root_login_attempt": (
         "T1110",
@@ -72,9 +97,9 @@ RULE_INFO = {
         "Verify the new source IP and review session activity",
     ),
     "web_login_bruteforce": (
-        "T1110",
-        "Brute Force",
-        "Review the source IP and protect the targeted web accounts",
+        None,
+        None,
+        "Review the source IP and verify whether the responses correspond to authentication attempts",
     ),
     "web_scanning": (
         "T1595",
@@ -87,9 +112,9 @@ RULE_INFO = {
         "Review the request sequence and source IP",
     ),
     "web_success_after_failures": (
-        "T1078",
-        "Valid Accounts",
-        "Review the session and reset the affected account credentials",
+        None,
+        None,
+        "Review application or identity-provider logs to confirm whether authentication succeeded",
     ),
 }
 
@@ -163,13 +188,24 @@ def _base_alert(
         "window_seconds": details.get("window_seconds", 60),
         **details,
     }
+    if rule in MITRE_MAPPING_NOTES:
+        alert["mitre_mapping_note"] = MITRE_MAPPING_NOTES[rule]
+    supporting_evidence = {
+        evidence.get("event_id"): evidence
+        for record in records
+        for evidence in record.get("supporting_evidence", [])
+        if evidence.get("event_id") is not None
+    }
+    if supporting_evidence:
+        alert["supporting_evidence"] = sorted(
+            supporting_evidence.values(), key=lambda item: item.get("timestamp", datetime.min)
+        )
     return alert
 
 
 def _event_occurrences(event: dict[str, Any]) -> int:
     """Return the represented occurrence count, defaulting legacy events to one."""
-    value = event.get("occurrence_count", 1)
-    return value if isinstance(value, int) and value > 0 else 1
+    return event_occurrences(event)
 
 
 def _event_count(records: list[dict[str, Any]]) -> int:
@@ -203,6 +239,7 @@ def merge_adjacent_alerts(
     for (rule, _ip), group in grouped.items():
         group.sort(key=lambda item: item.get("first_seen") or datetime.min)
         clusters: list[list[dict[str, Any]]] = []
+        cluster_last_seen: list[datetime] = []
         for alert in group:
             gap = merge_gap_seconds
             if gap is None:
@@ -210,12 +247,13 @@ def merge_adjacent_alerts(
             if (
                 not clusters
                 or alert.get("first_seen") is None
-                or alert["first_seen"]
-                > max(item["last_seen"] for item in clusters[-1]) + timedelta(seconds=gap)
+                or alert["first_seen"] > cluster_last_seen[-1] + timedelta(seconds=gap)
             ):
                 clusters.append([alert])
+                cluster_last_seen.append(alert["last_seen"])
             else:
                 clusters[-1].append(alert)
+                cluster_last_seen[-1] = max(cluster_last_seen[-1], alert["last_seen"])
         for cluster in clusters:
             if len(cluster) == 1:
                 result = dict(cluster[0])
@@ -252,6 +290,32 @@ def merge_adjacent_alerts(
                 result["usernames_targeted"] = sorted(
                     set().union(*(set(item.get("usernames_targeted", [])) for item in cluster))
                 )
+                session_activity = {}
+                for item in cluster:
+                    for session in item.get("session_activity", []):
+                        identity = (
+                            session.get("event_type"),
+                            session.get("timestamp"),
+                            session.get("hostname"),
+                            session.get("process_id"),
+                            session.get("username"),
+                        )
+                        session_activity[identity] = session
+                if session_activity:
+                    result["session_activity"] = sorted(
+                        session_activity.values(), key=lambda session: session["timestamp"]
+                    )
+                supporting_evidence = {
+                    evidence.get("event_id"): evidence
+                    for item in cluster
+                    for evidence in item.get("supporting_evidence", [])
+                    if evidence.get("event_id") is not None
+                }
+                if supporting_evidence:
+                    result["supporting_evidence"] = sorted(
+                        supporting_evidence.values(),
+                        key=lambda item: item.get("timestamp", datetime.min),
+                    )
                 for field in (
                     "paths",
                     "statuses",
@@ -275,22 +339,12 @@ def merge_adjacent_alerts(
             result["_merge_attempt_ids"] = list(
                 set().union(*(set(item.get("_merge_attempt_ids", [])) for item in cluster))
             )
-            result["_incident_event_counts"] = {
-                identity: max(
-                    item.get("_incident_event_counts", {}).get(identity, 0) for item in cluster
-                )
-                for identity in set().union(
-                    *(set(item.get("_incident_event_counts", {})) for item in cluster)
-                )
-            }
-            result["_merge_attempt_counts"] = {
-                identity: max(
-                    item.get("_merge_attempt_counts", {}).get(identity, 0) for item in cluster
-                )
-                for identity in set().union(
-                    *(set(item.get("_merge_attempt_counts", {})) for item in cluster)
-                )
-            }
+            for field in ("_incident_event_counts", "_merge_attempt_counts"):
+                counts: dict[Any, int] = {}
+                for item in cluster:
+                    for identity, count in item.get(field, {}).items():
+                        counts[identity] = max(counts.get(identity, 0), count)
+                result[field] = counts
             merged.append(result)
     merged.sort(
         key=lambda item: (
@@ -354,9 +408,21 @@ def _clusters(records: list[dict[str, Any]], window: timedelta) -> list[list[dic
     return clusters
 
 
+def _activity_waves(records: list[dict[str, Any]], window: timedelta) -> list[list[dict[str, Any]]]:
+    """Group same-source records until an inactivity gap exceeds the rule window."""
+    waves: list[list[dict[str, Any]]] = []
+    for record in sorted(records, key=get_event_time):
+        if not waves or get_event_time(record) - get_event_time(waves[-1][-1]) > window:
+            waves.append([record])
+        else:
+            waves[-1].append(record)
+    return waves
+
+
 def _is_failure(event: dict[str, Any]) -> bool:
     if event.get("event_type") == "authentication_failure":
-        return True
+        # Keep supported failures, but do not treat a "none" method probe as guessing.
+        return event.get("authentication_method") != "none"
     return event.get("event_type") == "web_request" and event.get("status") in (401, 403, 404)
 
 
@@ -366,7 +432,12 @@ def detect_brute_force(
     window: timedelta = DEFAULT_WINDOW,
     allowlist: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Detect and aggregate failed attempts by source IP and fixed window."""
+    """Detect same-source failure waves with a qualifying trailing-window burst.
+
+    Each wave continues while adjacent failures are no more than ``window`` apart.
+    A wave is emitted only when at least ``threshold`` weighted occurrences fit
+    in one inclusive trailing window; all unique records in that wave are retained.
+    """
     if threshold < 1 or window < timedelta(0):
         raise ValueError("threshold must be positive and window cannot be negative")
     grouped = group_events_by_ip(
@@ -374,19 +445,91 @@ def detect_brute_force(
     )
     alerts = []
     for ip, failures in grouped.items():
-        for cluster in _clusters(failures, window):
-            if _event_count(cluster) >= threshold:
+        for wave in _activity_waves(failures, window):
+            peak = _maximum_window_event_count(wave, window)
+            if peak >= threshold:
+                attempts = _event_count(wave)
                 alerts.append(
                     _base_alert(
                         "ssh_brute_force",
                         "Medium",
                         ip,
-                        cluster,
-                        f"{_count_word(_event_count(cluster), 'failed attempt')} observed within {int(window.total_seconds())} seconds.",
-                        attempt_count=_event_count(cluster),
+                        wave,
+                        f"{_count_word(attempts, 'failed attempt')} observed in one activity wave; "
+                        f"at least {threshold} occurred within an inclusive trailing "
+                        f"{int(window.total_seconds())}-second window.",
+                        attempt_count=attempts,
                         window_seconds=int(window.total_seconds()),
+                        qualifying_window_attempts=peak,
                     )
                 )
+    return alerts
+
+
+def _maximum_window_event_count(events: list[dict[str, Any]], window: timedelta) -> int:
+    """Return the maximum weighted event count in any trailing time window."""
+    left = 0
+    active_count = 0
+    maximum = 0
+    for right, event in enumerate(events):
+        current = get_event_time(event)
+        active_count += _event_occurrences(event)
+        while current - get_event_time(events[left]) > window:
+            active_count -= _event_occurrences(events[left])
+            left += 1
+        maximum = max(maximum, active_count)
+    return maximum
+
+
+def detect_low_and_slow_bruteforce(
+    events: list[dict[str, Any]],
+    threshold: int = 20,
+    window: timedelta = timedelta(hours=24),
+    short_threshold: int = BRUTE_FORCE_THRESHOLD,
+    short_window: timedelta = DEFAULT_WINDOW,
+    allowlist: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Detect sustained SSH failures that stay below the short brute-force limit.
+
+    Long windows are anchored at their first event, matching the existing
+    detection-window convention. Repeated records retain their occurrence weight.
+    """
+    if threshold < 1 or short_threshold < 1:
+        raise ValueError("threshold and short_threshold must be positive")
+    if window <= short_window or short_window < timedelta(0):
+        raise ValueError("window must be greater than a non-negative short_window")
+    failures = [
+        event
+        for event in events
+        if event.get("event_type") == "authentication_failure"
+        and not is_allowlisted(event.get("source_ip"), allowlist)
+    ]
+    alerts = []
+    for source_ip, source_events in group_events_by_ip(failures).items():
+        for cluster in _clusters(source_events, window):
+            attempts = _event_count(cluster)
+            if attempts < threshold:
+                continue
+            short_peak = _maximum_window_event_count(cluster, short_window)
+            if short_peak >= short_threshold:
+                continue
+            alerts.append(
+                _base_alert(
+                    "ssh_low_and_slow_bruteforce",
+                    "Medium",
+                    source_ip,
+                    cluster,
+                    f"{_count_word(attempts, 'failed attempt')} observed across "
+                    f"{int(window.total_seconds())} seconds while no "
+                    f"{int(short_window.total_seconds())}-second window reached "
+                    f"the {short_threshold}-attempt brute-force threshold.",
+                    attempt_count=attempts,
+                    window_seconds=int(window.total_seconds()),
+                    short_window_seconds=int(short_window.total_seconds()),
+                    short_window_attempts=short_peak,
+                    short_window_threshold=short_threshold,
+                )
+            )
     return alerts
 
 
@@ -413,7 +556,10 @@ def detect_password_spraying(
                         "Medium",
                         ip,
                         cluster,
-                        f"{_count_word(_event_count(cluster), 'failed attempt')} against {_count_word(len(usernames), 'distinct username')} within {int(window.total_seconds())} seconds.",
+                        f"Observed {_count_word(_event_count(cluster), 'failed attempt')} across "
+                        f"{_count_word(len(usernames), 'distinct username')} within "
+                        f"{int(window.total_seconds())} seconds: multi-account guessing; "
+                        "the log does not show whether a password was shared.",
                         attempt_count=_event_count(cluster),
                         distinct_usernames=len(usernames),
                         usernames=usernames,
@@ -450,7 +596,9 @@ def detect_username_enumeration(
                         "Medium",
                         ip,
                         cluster,
-                        f"{_count_word(len(usernames), 'distinct invalid username')} attempted within {int(window.total_seconds())} seconds.",
+                        f"Observed {_count_word(len(usernames), 'distinct invalid username')} "
+                        f"attempted within {int(window.total_seconds())} seconds: invalid-user "
+                        "probing; account discovery is not confirmed.",
                         distinct_usernames=len(usernames),
                         usernames=usernames,
                         window_seconds=int(window.total_seconds()),
@@ -505,6 +653,20 @@ def detect_success_after_failures(
     """Detect and aggregate successful logins after enough recent failures."""
     if failure_threshold < 1 or lookback < timedelta(0):
         raise ValueError("failure_threshold must be positive and lookback cannot be negative")
+    sessions_by_context: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        if event.get("event_type") != "session_opened":
+            continue
+        hostname = event.get("hostname")
+        process_id = event.get("process_id")
+        username = event.get("username")
+        if hostname and process_id is not None and username:
+            sessions_by_context[(hostname, process_id, username)].append(event)
+    session_times_by_context = {}
+    for key, sessions in sessions_by_context.items():
+        sessions.sort(key=get_event_time)
+        session_times_by_context[key] = [get_event_time(event) for event in sessions]
+
     alerts = []
     for ip, group in group_events_by_ip(events).items():
         if is_allowlisted(ip, allowlist):
@@ -538,6 +700,28 @@ def detect_success_after_failures(
             )
             failures_in_window = all_failures[left:right]
             usernames = {e.get("username") for e in success_cluster if e.get("username")}
+            session_activity: dict[Any, dict[str, Any]] = {}
+            for success_event in success_cluster:
+                context = (
+                    success_event.get("hostname"),
+                    success_event.get("process_id"),
+                    success_event.get("username"),
+                )
+                if not all(context):
+                    continue
+                sessions = sessions_by_context.get(context, [])
+                session_times = session_times_by_context.get(context, [])
+                success_time = get_event_time(success_event)
+                session_start = bisect_left(session_times, success_time)
+                session_end = bisect_right(session_times, success_time + lookback)
+                for session in sessions[session_start:session_end]:
+                    session_activity[_event_identity(session)] = {
+                        "event_type": "session_opened",
+                        "timestamp": get_event_time(session),
+                        "hostname": session["hostname"],
+                        "process_id": session["process_id"],
+                        "username": session["username"],
+                    }
             alert = _base_alert(
                 "ssh_success_after_failures",
                 "High",
@@ -548,6 +732,15 @@ def detect_success_after_failures(
                 failed_attempts=_event_count(failures_in_window),
                 username=sorted(usernames)[0] if usernames else None,
                 window_seconds=int(lookback.total_seconds()),
+                **(
+                    {
+                        "session_activity": sorted(
+                            session_activity.values(), key=lambda item: item["timestamp"]
+                        )
+                    }
+                    if session_activity
+                    else {}
+                ),
             )
             alerts.append(alert)
     return alerts
@@ -691,6 +884,15 @@ def _detect_all(
         candidates += detect_brute_force(
             events, brute["threshold"], timedelta(seconds=brute["window_seconds"])
         )
+        low_and_slow = settings["low_and_slow"]
+        if low_and_slow["enabled"]:
+            candidates += detect_low_and_slow_bruteforce(
+                events,
+                low_and_slow["threshold"],
+                timedelta(seconds=low_and_slow["window_seconds"]),
+                brute["threshold"],
+                timedelta(seconds=brute["window_seconds"]),
+            )
         candidates += detect_password_spraying(
             events, spray["username_threshold"], timedelta(seconds=spray["window_seconds"])
         )
@@ -752,6 +954,7 @@ def _detect_all(
         raise ValueError("log_type must be 'ssh' or 'web'")
     suppressible = {
         "ssh_brute_force",
+        "ssh_low_and_slow_bruteforce",
         "ssh_password_spraying",
         "ssh_username_enumeration",
         "ssh_root_login_attempt",
@@ -883,6 +1086,25 @@ def correlate_incidents(
             authentication_methods = sorted(
                 set().union(*(set(item.get("authentication_methods", [])) for item in bucket))
             )
+            session_activity: dict[tuple[Any, ...], dict[str, Any]] = {}
+            supporting_evidence: dict[Any, dict[str, Any]] = {}
+            evidence_event_ids: set[Any] = set()
+            for item in bucket:
+                evidence_event_ids.update(item.get("_incident_event_counts", {}).keys())
+                for evidence in item.get("supporting_evidence", []):
+                    evidence_id = evidence.get("event_id")
+                    if evidence_id is not None:
+                        supporting_evidence[evidence_id] = evidence
+                        evidence_event_ids.add(evidence_id)
+                for session in item.get("session_activity", []):
+                    identity = (
+                        session.get("event_type"),
+                        session.get("timestamp"),
+                        session.get("hostname"),
+                        session.get("process_id"),
+                        session.get("username"),
+                    )
+                    session_activity[identity] = session
             incidents.append(
                 {
                     "incident_id": f"INC-{len(incidents) + 1:03d}",
@@ -895,6 +1117,30 @@ def correlate_incidents(
                     **({"attempt_count": sum(event_counts.values())} if event_counts else {}),
                     "usernames_targeted": usernames,
                     "authentication_methods": authentication_methods,
+                    "evidence_event_ids": sorted(
+                        (event_id for event_id in evidence_event_ids if isinstance(event_id, str)),
+                        key=str,
+                    ),
+                    **(
+                        {
+                            "supporting_evidence": sorted(
+                                supporting_evidence.values(),
+                                key=lambda item: item.get("timestamp", datetime.min),
+                            )
+                        }
+                        if supporting_evidence
+                        else {}
+                    ),
+                    **(
+                        {
+                            "session_activity": sorted(
+                                session_activity.values(),
+                                key=lambda session: session["timestamp"],
+                            )
+                        }
+                        if session_activity
+                        else {}
+                    ),
                     **({"risk_score": score, "risk_band": band} if band is not None else {}),
                 }
             )
@@ -960,6 +1206,101 @@ def calculate_risk_scores(
     )
 
 
+def calculate_risk_explanations(
+    events: list[dict[str, Any]],
+    alerts: list[dict[str, Any]],
+    risk_scores: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Explain existing source-risk scores without changing their calculation."""
+    canonical_scores = risk_scores or calculate_risk_scores(events, alerts)
+    grouped = group_events_by_ip(events)
+    alert_rules: dict[str, set[str]] = defaultdict(set)
+    for alert in alerts:
+        source = alert.get("source_ip")
+        if source:
+            alert_rules[source].add(alert["rule"])
+        for source in alert.get("source_ips", []):
+            alert_rules[source].add(alert["rule"])
+
+    explanations = {}
+    for source_ip, source_events in grouped.items():
+        failures = sum(_event_occurrences(event) for event in source_events if _is_failure(event))
+        root_failure_count = sum(
+            _event_occurrences(event)
+            for event in source_events
+            if _is_failure(event) and event.get("username") == "root"
+        )
+        rules = alert_rules[source_ip]
+        confirmed_success_signal = bool(
+            {"ssh_success_after_failures", "web_success_after_failures"} & rules
+        )
+        rule_points = min(len(rules) * RISK_PER_RULE, RISK_RULE_CAP)
+        volume_points = min(
+            int(RISK_VOLUME_WEIGHT * math.log1p(failures) / math.log1p(RISK_VOLUME_REFERENCE)),
+            RISK_VOLUME_CAP,
+        )
+        root_points = RISK_ROOT_TARGETING if root_failure_count else 0
+        success_points = RISK_SUCCESS_AFTER_FAILURES if confirmed_success_signal else 0
+        subtotal = rule_points + volume_points + root_points + success_points
+        canonical = canonical_scores[source_ip]
+        adjustment = canonical["score"] - subtotal
+        explanations[source_ip] = {
+            "score": canonical["score"],
+            "band": canonical["band"],
+            "factors": {
+                "rule_breadth": {
+                    "evidence": len(rules),
+                    "contribution": rule_points,
+                    "policy": f"{RISK_PER_RULE} points per distinct rule, capped at {RISK_RULE_CAP}.",
+                },
+                "failure_volume": {
+                    "evidence": failures,
+                    "contribution": volume_points,
+                    "policy": (
+                        f"{RISK_VOLUME_WEIGHT} × log1p(failures) / log1p({RISK_VOLUME_REFERENCE}), "
+                        f"capped at {RISK_VOLUME_CAP}; weighted terminal failures only."
+                    ),
+                },
+                "root_targeting": {
+                    "evidence": root_failure_count,
+                    "contribution": root_points,
+                    "policy": f"Add {RISK_ROOT_TARGETING} points when at least one failed root attempt is present.",
+                },
+                "success_after_failures": {
+                    "evidence": confirmed_success_signal,
+                    "contribution": success_points,
+                    "policy": (
+                        f"Add {RISK_SUCCESS_AFTER_FAILURES} points when the success-after-failures "
+                        "detection is present."
+                    ),
+                },
+            },
+            "policy_adjustment": {
+                "contribution": adjustment,
+                "floor_applied": confirmed_success_signal
+                and subtotal < RISK_CONFIRMED_SUCCESS_FLOOR,
+                "unconfirmed_cap_applied": not confirmed_success_signal
+                and subtotal > RISK_UNCONFIRMED_CAP,
+                "policy": (
+                    f"Apply the existing 0–100 clamp, Critical floor {RISK_CONFIRMED_SUCCESS_FLOOR} "
+                    f"for success-after-failures, and unconfirmed cap {RISK_UNCONFIRMED_CAP}."
+                ),
+            },
+            "confidence": {
+                "status": "not_calibrated",
+                "rationale": (
+                    "No calibrated confidence model or representative labeled real-log corpus is available; "
+                    "this score is a triage aid, not a probability of compromise."
+                ),
+            },
+            "uncertainty": (
+                "Events sharing a NAT or proxy source may belong to different users; "
+                "log volume and rule breadth do not establish a common actor."
+            ),
+        }
+    return explanations
+
+
 def analyze_events(
     events: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
@@ -979,12 +1320,14 @@ def analyze_events(
             alert["risk_score"] = source_risk["score"]
             alert["risk_band"] = source_risk["band"]
     incidents = correlate_incidents(alerts, risk_scores)
+    risk_explanations = calculate_risk_explanations(events, alerts, risk_scores)
     for alert in alerts:
         alert.pop("_incident_event_counts", None)
     return {
         "alerts": alerts,
         "incidents": incidents,
         "risk_scores": risk_scores,
+        "risk_explanations": risk_explanations,
         "alerts_suppressed": suppressed,
     }
 

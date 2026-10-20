@@ -10,6 +10,7 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "brute_force": {"threshold": 5, "window_seconds": 60},
+    "low_and_slow": {"enabled": False, "threshold": 20, "window_seconds": 86400},
     "password_spraying": {"username_threshold": 5, "window_seconds": 60},
     "username_enumeration": {"threshold": 4, "window_seconds": 60},
     "distributed_bruteforce": {"ip_threshold": 5, "window_seconds": 120},
@@ -75,6 +76,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate thresholds and business-hour boundaries with clear errors."""
     for section, keys in {
         "brute_force": ("threshold", "window_seconds"),
+        "low_and_slow": ("threshold", "window_seconds"),
         "password_spraying": ("username_threshold", "window_seconds"),
         "username_enumeration": ("threshold", "window_seconds"),
         "distributed_bruteforce": ("ip_threshold", "window_seconds"),
@@ -91,6 +93,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     }.items():
         for key in keys:
             config[section][key] = _positive_int(config[section][key], f"{section}.{key}")
+    low_and_slow = config["low_and_slow"]
+    if not isinstance(low_and_slow["enabled"], bool):
+        raise ValueError("low_and_slow.enabled must be a boolean")
+    if (
+        low_and_slow["enabled"]
+        and low_and_slow["window_seconds"] <= config["brute_force"]["window_seconds"]
+    ):
+        raise ValueError(
+            "low_and_slow.window_seconds must be greater than brute_force.window_seconds"
+        )
     merge_gap = config["alert_merging"]["merge_gap_seconds"]
     if merge_gap is not None and (
         isinstance(merge_gap, bool) or not isinstance(merge_gap, int) or merge_gap < 0

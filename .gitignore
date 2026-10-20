@@ -18,3 +18,12 @@ sample_logs/*Loghub*
 *.egg-info/
 Thumbs.db
 .DS_Store
+
+# Common local environments, editor state, and Streamlit credentials
+venv/
+.vscode/
+.idea/
+.streamlit/secrets.toml
+
+# Local verification transcripts
+/FINAL_LOCAL_VERIFICATION.txt

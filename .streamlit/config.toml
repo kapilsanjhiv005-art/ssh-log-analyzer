@@ -10,8 +10,24 @@ toolbarMode = "minimal"
 
 [theme]
 base = "dark"
-primaryColor = "#48a9a6"
-backgroundColor = "#0e1117"
-secondaryBackgroundColor = "#1b222c"
-textColor = "#e9eff4"
-font = "sans serif"
+primaryColor = "#36d7f5"
+backgroundColor = "#070b16"
+secondaryBackgroundColor = "#10192b"
+textColor = "#edf4ff"
+font = "Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+borderColor = "#243651"
+dataframeBorderColor = "#243651"
+dataframeHeaderBackgroundColor = "#17253d"
+dataframeHeaderTextColor = "#ffffff"
+showWidgetBorder = true
+
+[theme.sidebar]
+primaryColor = "#35e0c1"
+backgroundColor = "#0b1120"
+secondaryBackgroundColor = "#10192b"
+textColor = "#edf4ff"
+borderColor = "#243651"
+dataframeBorderColor = "#243651"
+dataframeHeaderBackgroundColor = "#17253d"
+dataframeHeaderTextColor = "#ffffff"
+showWidgetBorder = true

@@ -52,6 +52,7 @@ def test_parser_exposes_requested_options_and_precedence_help(capsys):
     assert args.follow and args.quiet
     help_text = analyzer.build_parser().format_help()
     assert "CLI flags override config.yaml" in help_text
+    assert "--show-malformed" in help_text
     assert analyzer.main(["--version"]) == 0
     assert "sshlog-analyzer" in capsys.readouterr().out
 
@@ -239,6 +240,57 @@ def test_bad_cli_values_return_error_without_traceback(tmp_path, capsys):
     assert "Traceback" not in capsys.readouterr().err
 
 
+def test_show_malformed_prints_grouped_reasons_and_bounded_locations(tmp_path, capsys):
+    log = tmp_path / "malformed.log"
+    log.write_text(
+        "Oct 19 09:00:00 test sshd[1]: Failed password for root from nowhere\n"
+        "unknown local service record\n",
+        encoding="utf-8",
+    )
+
+    code = analyzer.main(
+        [
+            "--file",
+            str(log),
+            "--format",
+            "console",
+            "--show-malformed",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "invalid_source_ip: 1" in output
+    assert "line 1: invalid_source_ip" in output
+    assert "Failed password" not in output
+
+
+def test_show_malformed_supports_web_input(tmp_path, capsys):
+    log = tmp_path / "malformed-access.log"
+    log.write_text("not a combined access record\n", encoding="utf-8")
+
+    code = analyzer.main(
+        [
+            "--file",
+            str(log),
+            "--log-type",
+            "web",
+            "--format",
+            "console",
+            "--show-malformed",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "unsupported_or_truncated_format: 1" in output
+    assert "line 1: unsupported_or_truncated_format" in output
+
+
 def test_follow_emits_each_aggregate_only_once(tmp_path):
     log = tmp_path / "follow.log"
     log.write_text("", encoding="utf-8")
@@ -369,3 +421,81 @@ def test_follow_truncation_starts_a_fresh_bounded_window(tmp_path):
     assert not worker.is_alive()
     assert len(messages) == 2
     assert "attempts=5" in messages[1]
+
+
+def test_json_report_discloses_timestamp_timezone_assumptions(tmp_path):
+    log = tmp_path / "yearless.log"
+    log.write_text(
+        "Oct 19 09:00:00 host sshd[1]: Failed password for analyst from 192.0.2.10 port 22 ssh2\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "reports"
+
+    assert (
+        analyzer.main(
+            [
+                "--file",
+                str(log),
+                "--year",
+                "2016",
+                "--format",
+                "json",
+                "--output-dir",
+                str(output),
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+    report = json.loads((output / "alerts.json").read_text(encoding="utf-8"))
+    interpretation = report["timestamp_interpretation"]
+    assert interpretation["year_for_yearless_timestamps"] == 2016
+    assert "timezone-unspecified" in interpretation["timezone_assumption"]
+    assert "normalized to UTC" in interpretation["offset_timestamp_policy"]
+
+
+def test_csv_report_carries_shared_timestamp_interpretation_metadata():
+    interpretation = analyzer.timestamp_interpretation("ssh", 2016)
+    rows = csv.DictReader(
+        analyzer.render_csv(
+            [{"rule": "ssh_brute_force", "first_seen": "2016-10-19T09:00:00"}],
+            interpretation,
+        ).splitlines()
+    )
+
+    row = next(rows)
+    assert json.loads(row["timestamp_interpretation"]) == interpretation
+
+
+def test_cli_exports_successful_login_inventory_with_conservative_duration(tmp_path):
+    log = tmp_path / "session.log"
+    log.write_text(
+        "Oct 19 09:00:00 edge sshd[412]: Accepted password for analyst from 192.0.2.70 port 22 ssh2\n"
+        "Oct 19 09:00:01 edge sshd[412]: pam_unix(sshd:session): session opened for user analyst by (uid=0)\n"
+        "Oct 19 09:12:46 edge sshd[412]: pam_unix(sshd:session): session closed for user analyst\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "reports"
+
+    code = analyzer.main(
+        [
+            "--file",
+            str(log),
+            "--year",
+            "2016",
+            "--format",
+            "all",
+            "--output-dir",
+            str(output),
+            "--quiet",
+        ]
+    )
+
+    assert code == 0
+    report = json.loads((output / "alerts.json").read_text(encoding="utf-8"))
+    assert len(report["successful_logins"]) == 1
+    assert report["successful_logins"][0]["duration_seconds"] == 766
+    assert report["successful_logins"][0]["session_identifier"] is None
+    assert "Successful logins" in (output / "report.html").read_text(encoding="utf-8")
+    login_rows = list(csv.DictReader((output / "successful_logins.csv").open(encoding="utf-8")))
+    assert login_rows[0]["duration_seconds"] == "766"

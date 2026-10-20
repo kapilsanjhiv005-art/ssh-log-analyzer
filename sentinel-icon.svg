@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Sentinel Log Analyser concept icon</title>
+  <rect width="128" height="128" rx="22" fill="#0B1220"/>
+  <path d="M64 12 108 29v31c0 30-17 46-44 57C37 106 20 90 20 60V29z" fill="#1E2A3F" stroke="#22D3EE" stroke-width="5"/>
+  <path d="M39 64c7-11 15-16 25-16s18 5 25 16c-7 11-15 16-25 16S46 75 39 64z" fill="#0B1220" stroke="#E9EFF4" stroke-width="4"/>
+  <circle cx="64" cy="64" r="7" fill="#22D3EE"/>
+  <path d="M40 42h13M75 42h13M43 88h42" stroke="#22D3EE" stroke-width="4" stroke-linecap="round"/>
+</svg>

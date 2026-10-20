@@ -1,6 +1,11 @@
 brute_force:
   threshold: 5
   window_seconds: 60
+low_and_slow:
+  # Opt-in until representative benign real-log evaluation supports enabling it by default.
+  enabled: false
+  threshold: 20
+  window_seconds: 86400
 password_spraying:
   username_threshold: 5
   window_seconds: 60

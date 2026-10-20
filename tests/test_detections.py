@@ -304,3 +304,99 @@ def test_invalid_brute_force_threshold():
 def test_invalid_spraying_threshold():
     with pytest.raises(ValueError):
         detect_password_spraying([], username_threshold=0)
+
+
+def test_multi_account_and_invalid_user_probes_do_not_claim_unsupported_techniques():
+    multi_account = detect_password_spraying(
+        [make_event(i, source_ip="192.0.2.71", username=f"account{i}") for i in range(5)]
+    )[0]
+    invalid_users = detect_username_enumeration(
+        [
+            make_event(i, source_ip="192.0.2.72", username=f"unknown{i}", invalid_user=True)
+            for i in range(4)
+        ]
+    )[0]
+
+    assert multi_account["rule"] == "ssh_password_spraying"
+    assert multi_account["mitre_attack_id"] is None
+    assert "one password" in multi_account["mitre_mapping_note"]
+    assert "multi-account" in multi_account["description"].casefold()
+    assert invalid_users["rule"] == "ssh_username_enumeration"
+    assert invalid_users["mitre_attack_id"] is None
+    assert "confirmed account discovery" in invalid_users["mitre_mapping_note"]
+
+
+def test_brute_force_keeps_full_activity_wave_across_adjacent_windows():
+    timestamps = [
+        "2026-10-19T11:03:39",
+        "2026-10-19T11:03:43",
+        "2026-10-19T11:03:48",
+        "2026-10-19T11:03:52",
+        "2026-10-19T11:03:56",
+        "2026-10-19T11:04:00",
+        "2026-10-19T11:04:04",
+        "2026-10-19T11:04:10",
+        "2026-10-19T11:04:14",
+        "2026-10-19T11:04:18",
+        "2026-10-19T11:04:23",
+        "2026-10-19T11:04:27",
+        "2026-10-19T11:04:32",
+        "2026-10-19T11:04:36",
+        "2026-10-19T11:04:40",
+        "2026-10-19T11:04:45",
+    ]
+    events = [make_event(0, source_ip="192.0.2.10") for _ in timestamps]
+    for event, timestamp in zip(events, timestamps, strict=True):
+        event["timestamp"] = timestamp
+
+    alerts = detect_brute_force(events, threshold=5, window=timedelta(seconds=60))
+
+    assert len(alerts) == 1
+    assert alerts[0]["attempt_count"] == 16
+    assert alerts[0]["first_seen"] == datetime.fromisoformat(timestamps[0])
+    assert alerts[0]["last_seen"] == datetime.fromisoformat(timestamps[-1])
+
+
+def test_brute_force_keeps_separate_waves_and_sources_separate():
+    events = [make_event(i * 5, source_ip="192.0.2.10") for i in range(5)]
+    events.extend(make_event(600 + i * 5, source_ip="192.0.2.10") for i in range(5))
+    events.extend(make_event(i * 5, source_ip="198.51.100.10") for i in range(5))
+
+    alerts = detect_brute_force(events, threshold=5, window=timedelta(seconds=60))
+
+    assert [(alert["source_ip"], alert["attempt_count"]) for alert in alerts] == [
+        ("192.0.2.10", 5),
+        ("192.0.2.10", 5),
+        ("198.51.100.10", 5),
+    ]
+
+
+def test_failed_none_probe_does_not_trigger_password_guessing_detection():
+    password_failure = make_event(0, source_ip="192.0.2.44")
+    password_failure["authentication_method"] = "password"
+    method_probe = make_event(5, source_ip="192.0.2.44")
+    method_probe["authentication_method"] = "none"
+
+    assert (
+        detect_brute_force(
+            [password_failure, method_probe], threshold=2, window=timedelta(seconds=60)
+        )
+        == []
+    )
+    assert (
+        len(
+            detect_brute_force(
+                [password_failure, {**password_failure, "timestamp": "2026-10-19T09:00:10"}],
+                threshold=2,
+                window=timedelta(seconds=60),
+            )
+        )
+        == 1
+    )
+
+
+def test_failed_none_probe_does_not_trigger_root_password_detection():
+    probe = make_event(0, username="root", source_ip="192.0.2.45")
+    probe["authentication_method"] = "none"
+
+    assert detect_root_attempts([probe], minimum_attempts=1) == []

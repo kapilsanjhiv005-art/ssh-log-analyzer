@@ -509,6 +509,41 @@ def test_repeated_event_occurrences_count_toward_thresholds_and_risk():
     assert result["risk_scores"]["203.0.113.88"]["score"] == 15
 
 
+def test_multiple_repeated_records_preserve_methods_and_deduplicate_incident_evidence():
+    first = event(0, ip="203.0.113.90", username="alice")
+    first.update(occurrence_count=3, authentication_method="password", _event_id="repeat-1")
+    second = event(1, ip="203.0.113.90", username="bob")
+    second.update(occurrence_count=2, authentication_method="publickey", _event_id="repeat-2")
+
+    result = analyze_events(
+        [first, second], config={"password_spraying": {"username_threshold": 2}}
+    )
+
+    brute = next(alert for alert in result["alerts"] if alert["rule"] == "ssh_brute_force")
+    assert brute["attempt_count"] == 5
+    assert brute["authentication_methods"] == ["password", "publickey"]
+    incident = result["incidents"][0]
+    assert incident["attempt_count"] == 5
+    assert incident["authentication_methods"] == ["password", "publickey"]
+
+
+def test_password_spraying_and_single_account_brute_force_have_distinct_evidence():
+    same_account = [event(i, ip="203.0.113.91", username="alice") for i in range(5)]
+    sprayed_accounts = [
+        event(i, ip="203.0.113.92", username=name)
+        for i, name in enumerate(("alice", "bob", "carol", "dave", "erin"))
+    ]
+
+    result = analyze_events(same_account + sprayed_accounts)
+    alerts_by_ip = {
+        ip: {alert["rule"] for alert in result["alerts"] if alert["source_ip"] == ip}
+        for ip in ("203.0.113.91", "203.0.113.92")
+    }
+
+    assert alerts_by_ip["203.0.113.91"] == {"ssh_brute_force"}
+    assert alerts_by_ip["203.0.113.92"] == {"ssh_brute_force", "ssh_password_spraying"}
+
+
 def test_overlapping_rule_incident_reports_deduplicated_evidence():
     events = [event(i, username=name) for i, name in enumerate(("a", "b", "c", "d", "e"))]
     for item in events:

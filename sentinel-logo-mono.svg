@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="144" viewBox="0 0 720 144" role="img" aria-labelledby="title">
+  <title id="title">Sentinel Log Analyser monochrome concept logo</title>
+  <rect width="720" height="144" rx="18" fill="#fff"/>
+  <path d="M72 18 120 36v34c0 32-19 49-48 61C43 119 24 102 24 70V36z" fill="#fff" stroke="#111" stroke-width="5"/>
+  <path d="M43 69h58M49 56h13m7 0h29M49 82h10m7 0h23" fill="none" stroke="#111" stroke-width="5" stroke-linecap="round"/>
+  <path d="M52 69c6-10 14-15 23-15s17 5 23 15c-6 10-14 15-23 15s-17-5-23-15z" fill="#fff" stroke="#111" stroke-width="3"/>
+  <circle cx="75" cy="69" r="5" fill="#111"/>
+  <text x="152" y="66" fill="#111" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700">Sentinel Log Analyser</text>
+  <text x="154" y="101" fill="#333" font-family="Segoe UI, Arial, sans-serif" font-size="18">See the attack in your logs.</text>
+</svg>
